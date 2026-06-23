@@ -82,6 +82,7 @@ export class SSHSession {
   private negotiatedMacS2C: string = 'none';
 
   private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+  private shellReadyTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     ws: WebSocket,
@@ -856,8 +857,19 @@ export class SSHSession {
           const shellReq = this.channel.buildShellRequest();
           await this.sendEncrypted(shellReq);
           this.state = 'shell-requested';
+          // 设置超时兜底：如果服务器不发送 shell 确认，3秒后自动进入 ready
+          this.shellReadyTimeout = setTimeout(() => {
+            if (this.state === 'shell-requested') {
+              this.state = 'ready';
+              this.sendStatus('Shell 已就绪');
+            }
+          }, 3000);
         } else if (this.state === 'shell-requested') {
           // Shell 请求确认，进入 ready 状态
+          if (this.shellReadyTimeout) {
+            clearTimeout(this.shellReadyTimeout);
+            this.shellReadyTimeout = null;
+          }
           this.state = 'ready';
           this.sendStatus('Shell 已就绪');
         }
@@ -874,6 +886,10 @@ export class SSHSession {
         // 某些 SSH 服务器（如 Dropbear）不会为 shell 请求发送 CHANNEL_SUCCESS，
         // 而是直接发送 shell 输出。收到 CHANNEL_DATA 说明 shell 已就绪。
         if (this.state === 'shell-requested') {
+          if (this.shellReadyTimeout) {
+            clearTimeout(this.shellReadyTimeout);
+            this.shellReadyTimeout = null;
+          }
           this.state = 'ready';
           this.sendStatus('Shell 已就绪');
         }
@@ -971,6 +987,10 @@ export class SSHSession {
     if (this.keepaliveInterval) {
       clearInterval(this.keepaliveInterval);
       this.keepaliveInterval = null;
+    }
+    if (this.shellReadyTimeout) {
+      clearTimeout(this.shellReadyTimeout);
+      this.shellReadyTimeout = null;
     }
     try { this.socket.close(); } catch {}
     try { this.ws.close(normal ? 1000 : 1011); } catch {}
