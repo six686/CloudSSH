@@ -13,8 +13,10 @@ export class SSHPacketParser {
   }
 
   async nextPacket(blockSize: number, decrypt: (
-    data: Uint8Array, seq: number, aad?: Uint8Array
-  ) => Uint8Array | Promise<Uint8Array | null> | null, hasAuthTag: boolean = false): Promise<SSHPacket | null> {
+    data: Uint8Array, seq: number, aad?: Uint8Array, commit?: boolean
+  ) => Uint8Array | Promise<Uint8Array | null> | null, hasAuthTag: boolean = false,
+  macLength: number = 0,
+  verifyMac?: (packet: Uint8Array, mac: Uint8Array, seq: number) => boolean | Promise<boolean>): Promise<SSHPacket | null> {
     if (hasAuthTag) {
       if (this.buffer.length < 4) return null;
       const packetLength = readUint32(this.buffer, 0);
@@ -27,7 +29,7 @@ export class SSHPacketParser {
 
       const lengthField = raw.slice(0, 4);
       const dataToDecrypt = raw.slice(4);
-      const decrypted = await decrypt(dataToDecrypt, this.seqNum, lengthField);
+      const decrypted = await decrypt(dataToDecrypt, this.seqNum, lengthField, true);
       if (!decrypted) return null;
 
       const paddingLength = decrypted[0];
@@ -46,7 +48,7 @@ export class SSHPacketParser {
     if (this.buffer.length < blockSize) return null;
 
     const header = await decrypt(
-      this.buffer.slice(0, blockSize), this.seqNum
+      this.buffer.slice(0, blockSize), this.seqNum, undefined, false
     );
     if (!header) return null;
 
@@ -56,13 +58,21 @@ export class SSHPacketParser {
     const totalBlocks = Math.ceil((4 + packetLength) / blockSize);
     const totalSize = totalBlocks * blockSize;
 
-    if (this.buffer.length < totalSize) return null;
+    if (this.buffer.length < totalSize + macLength) return null;
 
     const encryptedPacket = this.buffer.slice(0, totalSize);
-    this.buffer = this.buffer.slice(totalSize);
+    const mac = this.buffer.slice(totalSize, totalSize + macLength);
+    this.buffer = this.buffer.slice(totalSize + macLength);
 
-    const decrypted = await decrypt(encryptedPacket, this.seqNum);
+    const decrypted = await decrypt(encryptedPacket, this.seqNum, undefined, true);
     if (!decrypted) return null;
+
+    if (verifyMac && macLength > 0) {
+      const macValid = await verifyMac(decrypted, mac, this.seqNum);
+      if (!macValid) {
+        throw new Error('Invalid packet MAC');
+      }
+    }
 
     const paddingLength = decrypted[4];
     const payload = decrypted.slice(5, 5 + packetLength - 1 - paddingLength);
@@ -73,6 +83,7 @@ export class SSHPacketParser {
       length: packetLength,
       paddingLength,
       payload,
+      mac,
     };
   }
 
@@ -95,7 +106,8 @@ export class SSHPacketBuilder {
     blockSize: number,
     encrypt: ((data: Uint8Array, seq: number, aad?: Uint8Array) => Uint8Array | Promise<Uint8Array>) | null,
     seqNum: number,
-    hasAuthTag: boolean = false
+    hasAuthTag: boolean = false,
+    mac?: (packet: Uint8Array, seq: number) => Uint8Array | Promise<Uint8Array>
   ): Promise<Uint8Array> {
     const packetLength = 1 + payload.length;
     // For AES-GCM (hasAuthTag), padding aligns the encrypted portion
@@ -123,7 +135,6 @@ export class SSHPacketBuilder {
 
     packet.set(payload, 5);
 
-    const crypto = globalThis.crypto;
     const randomPadding = new Uint8Array(paddingLength);
     crypto.getRandomValues(randomPadding);
     packet.set(randomPadding, 5 + payload.length);
@@ -138,7 +149,15 @@ export class SSHPacketBuilder {
         result.set(encryptedData, 4);
         return result;
       }
-      return await encrypt(packet, seqNum);
+      const encryptedPacket = await encrypt(packet, seqNum);
+      if (mac) {
+        const macBytes = await mac(packet, seqNum);
+        const result = new Uint8Array(encryptedPacket.length + macBytes.length);
+        result.set(encryptedPacket, 0);
+        result.set(macBytes, encryptedPacket.length);
+        return result;
+      }
+      return encryptedPacket;
     }
 
     return packet;

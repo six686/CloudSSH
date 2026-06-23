@@ -1,5 +1,10 @@
 import { SSH_MSG_KEXINIT, KEXInitMessage } from '../types';
-import { encodeUint32, concat } from './utils';
+import {
+  SUPPORTED_ENCRYPTION_ALGORITHMS,
+  SUPPORTED_KEX_ALGORITHMS,
+  SUPPORTED_MAC_ALGORITHMS
+} from './algorithms';
+import { concat } from './utils';
 
 export class KEXInitBuilder {
   static build(): Uint8Array {
@@ -12,12 +17,12 @@ export class KEXInitBuilder {
     parts.push(cookie);
 
     const algorithmLists = [
-      'ecdh-sha2-nistp256',
+      SUPPORTED_KEX_ALGORITHMS.join(','),
       'ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256,ssh-rsa',
-      'aes256-gcm@openssh.com,aes128-gcm@openssh.com',
-      'aes256-gcm@openssh.com,aes128-gcm@openssh.com',
-      'none',
-      'none',
+      SUPPORTED_ENCRYPTION_ALGORITHMS.join(','),
+      SUPPORTED_ENCRYPTION_ALGORITHMS.join(','),
+      SUPPORTED_MAC_ALGORITHMS.join(','),
+      SUPPORTED_MAC_ALGORITHMS.join(','),
       'none',
       'none',
       '',
@@ -68,9 +73,9 @@ export function parseKEXInit(data: Uint8Array): KEXInitMessage {
   };
 }
 
-export function negotiate(clientList: string[], serverList: string[]): string {
+export function negotiate(clientList: string[], serverList: string[], category: string = 'algorithm'): string {
   for (const algo of clientList) {
     if (serverList.includes(algo)) return algo;
   }
-  throw new Error(`No common algorithm: ${clientList} vs ${serverList}`);
+  throw new Error(`No common ${category}: client=[${clientList.join(',')}] server=[${serverList.join(',')}]`);
 }

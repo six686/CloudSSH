@@ -5,14 +5,18 @@ export class KeyDerivation {
   static async deriveKeys(
     sharedSecret: Uint8Array,
     exchangeHash: Uint8Array,
-    sessionID: Uint8Array
+    sessionID: Uint8Array,
+    ivLengthC2S: number = 12,
+    ivLengthS2C: number = 12,
+    integrityKeyLengthC2S: number = 32,
+    integrityKeyLengthS2C: number = 32
   ): Promise<SessionKeys> {
-    const ivC2S    = await this.expandKey(sharedSecret, exchangeHash, 'A', sessionID, 12);
-    const ivS2C    = await this.expandKey(sharedSecret, exchangeHash, 'B', sessionID, 12);
+    const ivC2S    = await this.expandKey(sharedSecret, exchangeHash, 'A', sessionID, ivLengthC2S);
+    const ivS2C    = await this.expandKey(sharedSecret, exchangeHash, 'B', sessionID, ivLengthS2C);
     const keyC2S   = await this.expandKey(sharedSecret, exchangeHash, 'C', sessionID, 32);
     const keyS2C   = await this.expandKey(sharedSecret, exchangeHash, 'D', sessionID, 32);
-    const intKeyC2S = await this.expandKey(sharedSecret, exchangeHash, 'E', sessionID, 32);
-    const intKeyS2C = await this.expandKey(sharedSecret, exchangeHash, 'F', sessionID, 32);
+    const intKeyC2S = await this.expandKey(sharedSecret, exchangeHash, 'E', sessionID, integrityKeyLengthC2S);
+    const intKeyS2C = await this.expandKey(sharedSecret, exchangeHash, 'F', sessionID, integrityKeyLengthS2C);
 
     return {
       ivClientToServer: ivC2S,

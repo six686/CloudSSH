@@ -57,41 +57,86 @@
 
 ### 安全可靠
 
-- **端到端加密**：完整的 SSH-2.0 协议实现，包括 ECDH 密钥交换、Ed25519 签名认证以及 AES-256-GCM 数据加密。
-- **安全加固体系**：内置针对 IPv6 与保留地址的 SSRF 防护、API 请求频率限制（防爆破），并在本地使用 AES-GCM 算法加密存储您的服务器凭证。
+- **端到端加密**：完整的 SSH-2.0 协议实现，支持 Curve25519-SHA256（优先）和 ECDH-NISTP256 密钥交换，AES-256-GCM（优先）/ AES-128-GCM / AES-256-CTR 数据加密，以及 HMAC-SHA2-256/512 完整性校验。
+- **多算法主机密钥验证**：支持 Ed25519、ECDSA P-256、RSA 签名验证，首次连接展示 SHA-256 指纹（TOFU 模式）。
+- **安全加固体系**：内置针对 IPv6 与保留地址的 SSRF 防护、API 请求频率限制（防爆破），并在本地使用 AES-256-GCM 算法加密存储您的服务器凭证。
 - **人机验证**：支持 Cloudflare Turnstile 验证，防止恶意机器人滥用。
 - **隔离的会话状态**：借助 Cloudflare Durable Objects 和 Hibernation API，每个终端会话都在沙盒内安全、持久地运行。
+- **凭据零暴露**：One-Time-Token 机制确保密码/私钥不经过前端，完全在 Worker 内部安全流转。
 
 <a id="features"></a>
 ## 核心特性
 
-- **完整的 SSH 握手**：原生 TypeScript 实现 SSH 传输层协议与用户认证协议。
+- **纯 TypeScript SSH-2.0 实现**：完全自研的 SSH 协议栈，不依赖任何第三方 SSH 库，基于 Web Crypto API 实现全部加密操作。
+- **多算法密钥交换**：支持 Curve25519-SHA256（优先）和 ECDH-NISTP256 两种 KEX 算法，适配各类 SSH 服务器（包括 Dropbear）。
 - **IPv4/IPv6 双栈**：完整支持 IPv4 和 IPv6 地址连接，包括 IPv6 方括号格式自动处理。
 - **多种认证方式**：支持标准 SSH 密码认证以及基于 Ed25519 的纯文本私钥认证。
-- **防范中间人攻击 (TOFU)**：首次连接自动提取服务器 Host Key（SHA-256 指纹）并显示，防止被恶意节点窃听。
+- **防范中间人攻击 (TOFU)**：首次连接自动提取服务器 Host Key（SHA-256 指纹）并显示，支持 Ed25519/ECDSA/RSA 签名验证。
 - **全功能极客终端**：基于 `@xterm/xterm` 与 `@xterm/addon-webgl` 硬件加速渲染引擎，保证海量日志输出顺滑不卡顿。
 - **个性化 UI**：提供 Cyberpunk、Glacier、Gruvbox 等经典终端主题一键切换，支持移动端适配。
-- **原生文件传输**：集成 zmodem.js，只需在终端中执行 `rz` / `sz` 命令，即可在浏览器直接与服务器双向拖放/下载文件。
+- **原生文件传输**：集成 [trzsz.js](https://github.com/trzsz/trzsz.js)，支持 `trz`（上传）/ `tsz`（下载）命令进行文件传输，兼容 tmux 会话。还支持拖拽文件到终端窗口直接上传、目录传输及断点续传等高级功能。（需远程服务器安装 [trzsz](https://trzsz.github.io/)）
+- **GitHub OAuth 集成**：支持 GitHub 登录，用户可保存和管理常用 SSH 服务器，实现一键连接。
 
 <a id="architecture"></a>
 ## 架构说明
 
+### 系统架构
+
 ```mermaid
 flowchart TB
-    Browser["浏览器客户端<br/>(TypeScript + xterm.js)"]
-    CF["Cloudflare Edge Network"]
-    DO["Durable Object<br/>(SSH 会话管理)"]
-    Server["目标 SSH 服务器<br/>(如 Linux VPS)"]
+    subgraph "浏览器客户端"
+        UI["前端 UI<br/>TypeScript + xterm.js"]
+        Trzsz["trzsz 文件传输"]
+    end
+    
+    subgraph "Cloudflare Edge Network"
+        Worker["Worker<br/>路由 + API"]
+        SSH_DO["SSHSessionDO<br/>SSH 会话管理"]
+        User_DO["UserDBDO<br/>用户数据管理"]
+    end
+    
+    subgraph "目标服务器"
+        SSH["SSH 服务器<br/>(OpenSSH/Dropbear)"]
+    end
 
-    Browser <-->|"WebSocket<br/>(前端 UI 输入与终端输出)"| CF
-    CF <-->|"WebSocket"<br/>路由与长连接| DO
-    DO <-->|"TCP Socket<br/>@cloudflare/sockets"| Server
+    UI <-->|"WebSocket<br/>终端 I/O"| Worker
+    Trzsz <-->|"trzsz 协议"| UI
+    Worker <-->|"WebSocket"| SSH_DO
+    Worker <-->|"Internal API"| User_DO
+    SSH_DO <-->|"TCP Socket<br/>@cloudflare/sockets"| SSH
 ```
 
-1. 用户在前端输入主机 IP、账号和密码。
+### 核心组件
+
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| **Worker 入口** | `src/worker/index.ts` | HTTP 路由、API 处理、WebSocket 升级 |
+| **SSHSessionDO** | `src/worker/durable-object.ts` | SSH 会话生命周期管理、SSRF 防护 |
+| **UserDBDO** | `src/worker/user-db.ts` | 用户数据、服务器配置、速率限制（SQLite） |
+| **SSHSession** | `src/worker/ssh-session.ts` | SSH 协议状态机（连接→版本→密钥交换→认证→交互） |
+| **SSH 协议栈** | `src/ssh/*.ts` | 纯 TypeScript SSH-2.0 实现（传输层、加密、认证、通道） |
+| **前端终端** | `frontend/src/terminal.ts` | xterm.js 封装、trzsz 集成、WebSocket 管理 |
+
+### SSH 协议实现
+
+本项目实现了完整的 SSH-2.0 协议栈：
+
+| 层级 | 实现 | 支持算法 |
+|------|------|----------|
+| **密钥交换** | `kex-curve25519.ts` / `kex-ecdh.ts` | curve25519-sha256, ecdh-sha2-nistp256 |
+| **数据加密** | `crypto.ts` | aes256-gcm, aes128-gcm, aes256-ctr, aes192-ctr, aes128-ctr |
+| **完整性校验** | `crypto.ts` | hmac-sha2-256, hmac-sha2-512, hmac-sha1 |
+| **主机密钥** | `ssh-session.ts` | Ed25519, ECDSA P-256, RSA |
+| **用户认证** | `auth.ts` | 密码认证, Ed25519 公钥认证 |
+| **通道管理** | `channel.ts` | session channel, PTY, shell, window-change |
+
+### 数据流
+
+1. 用户在前端输入主机 IP、账号和密码（或通过 GitHub OAuth 选择已保存的服务器）。
 2. 前端与后端的 Durable Object 建立 WebSocket 连接。
-3. DO 接收凭据，使用 `@cloudflare/sockets` 与目标 SSH 服务器建立 TCP 连接。
-4. DO 纯代码实现 SSH 协议协商（密钥交换、密码认证等），并将加密后的终端数据通过 WebSocket 转发给前端。
+3. SSHSessionDO 接收凭据，使用 `@cloudflare/sockets` 与目标 SSH 服务器建立 TCP 连接。
+4. SSHSession 执行完整的 SSH 协议协商（版本交换→密钥交换→认证→打开通道→PTY→Shell）。
+5. 加密的终端数据通过 WebSocket 在前端和 SSH 服务器之间双向转发。
 
 <a id="quick-start"></a>
 ## 快速部署
@@ -107,9 +152,10 @@ flowchart TB
 #### 方式一：通过 GitHub 绑定自动部署（推荐）
 
 1. **Fork 本仓库** 到你的 GitHub 账号。
-2. **修改域名**：在进行部署前，请先将 `wrangler.toml` 中的自定义域名改成你自己的域名（要求：域名需要先在 Cloudflare 中完成注册或接入）。
-3. **一键部署**：登录 Cloudflare，进入 Workers & Pages 绑定你的 GitHub 账号，选择刚才 Fork 的仓库进行应用创建。
-4. **填写构建命令**：在部署设置中，请务必将“构建命令”（Build command）填写为 `npm install && npm run build:frontend`，然后点击保存并部署（无需填写构建输出目录）。
+2. **一键部署**：登录 Cloudflare，进入 Workers & Pages 绑定你的 GitHub 账号，选择刚才 Fork 的仓库进行应用创建。
+3. **填写构建命令**：在部署设置中，请务必将"构建命令"（Build command）填写为 `pnpm run build:frontend`，然后点击保存并部署（无需填写构建输出目录）。
+4. **访问应用**：部署成功后，可通过默认域名 `https://cloudssh.<你的子域>.workers.dev` 访问。
+5. **绑定自定义域名**（可选）：在 Cloudflare Dashboard 的 Workers 设置中，进入 "Triggers" → "Custom Domains" 添加你的域名。
 
 #### 方式二：本地命令行部署
 
@@ -121,7 +167,8 @@ flowchart TB
 
 2. **安装依赖**
    ```bash
-   npm install
+   npm install -g pnpm
+   pnpm install
    ```
 
 3. **登录 Cloudflare**
@@ -131,10 +178,12 @@ flowchart TB
 
 4. **一键部署**
    ```bash
-   npm run deploy
+   pnpm run deploy
    ```
 
 部署完成后，Wrangler 会输出你的 Worker URL。打开浏览器访问该 URL，即可开始使用你的 Web SSH 终端。
+
+5. **绑定自定义域名**（可选）：在 Cloudflare Dashboard 的 Workers 设置中，进入 "Triggers" → "Custom Domains" 添加你的域名。
 
 #### 可选：配置 Turnstile 人机验证
 
@@ -142,11 +191,9 @@ flowchart TB
 
 1. **创建 Turnstile Widget**：登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)，进入 Turnstile 页面创建一个新的 Widget。
 2. **获取密钥**：创建后会获得一个 **Site Key**（公开）和一个 **Secret Key**（保密）。
-3. **配置环境变量**：
-   - **方式一部署**：在 Cloudflare Dashboard 的 Workers 设置中，添加以下环境变量：
-     - `TURNSTILE_SECRET` = 你的 Secret Key
-     - `TURNSTILE_SITEKEY` = 你的 Site Key
-   - **方式二部署**：取消 `wrangler.toml` 中 `TURNSTILE_SECRET` 和 `TURNSTILE_SITEKEY` 的注释，填入对应密钥。
+3. **配置环境变量**：在 Cloudflare Dashboard 的 Workers 设置中，进入 "Settings" → "Variables and Secrets"，添加以下环境变量：
+   - `TURNSTILE_SECRET` = 你的 Secret Key（类型选择 Secret）
+   - `TURNSTILE_SITEKEY` = 你的 Site Key（类型选择 Text）
 4. **重新部署**：运行部署命令使配置生效。
 
 > **说明**：Turnstile 验证为会话级别，用户通过验证后当前会话内所有功能可用，关闭浏览器后需重新验证。
@@ -162,38 +209,66 @@ flowchart TB
    - **Authorization callback URL**：`https://your-domain.com/api/auth/callback`
    - 创建后获得 **Client ID**，点击 **Generate a new client secret** 生成 **Client Secret**（仅显示一次，请立即保存）
 
-2. **配置环境变量**：
-   - **方式一部署**：在 Cloudflare Dashboard 的 Workers 设置中，添加以下环境变量：
-     - `GITHUB_CLIENT_ID` = 你的 Client ID
-     - `BASE_URL` = `https://your-domain.com`（你的部署域名）
-   - **方式二部署**：取消 `wrangler.toml` 中 `GITHUB_CLIENT_ID` 和 `BASE_URL` 的注释，填入对应值。
+2. **配置环境变量**：在 Cloudflare Dashboard 的 Workers 设置中，进入 "Settings" → "Variables and Secrets"，添加以下环境变量：
+   - `GITHUB_CLIENT_ID` = 你的 Client ID（类型选择 Text）
+   - `BASE_URL` = `https://your-domain.com`（你的部署域名，类型选择 Text）
+   - `GITHUB_CLIENT_SECRET` = 你的 Client Secret（类型选择 Secret）
 
-3. **设置 Secrets（敏感密钥）**：
-   - 部署项目后，进入 Cloudflare Dashboard → 你的 Worker 项目 (`cloudssh`) → **Settings (设置)** → **Variables and Secrets (变量和机密)**。
-   - 点击 **Add (添加)** 环境变量：
-     - **Type (类型)**：选择 **Secret (机密)**（非常重要，不要选 Text）
-     - **变量名**：`GITHUB_CLIENT_SECRET`
-     - **值**：粘贴你获取到的 Client Secret
-   - 随后点击 **Save and deploy (保存并部署)**。
-
-4. **重新部署**：如果你是刚刚修改了环境变量，且是首次启用该功能，请务必删除旧版并全新部署以初始化数据库。
+3. **重新部署**：如果你是刚刚修改了环境变量，且是首次启用该功能，请务必删除旧版并全新部署以初始化数据库。
 
 > **说明**：服务器凭据（密码/私钥）在数据库中使用 AES-256-GCM 加密存储，本地加密密钥将自动生成并安全地存储在数据库中（也可在环境变量中手动设置 `SESSION_SECRET` 来指定）。连接时凭据不经过前端，通过 one-time-token 机制安全传递。
 
-> **注意**：首次启用此功能需要从零部署（删除旧 Worker 后重新部署），因为需要初始化新的 Durable Object。可通过 `npx wrangler delete cloudssh` 删除旧 Worker，然后运行 `npm run deploy` 重新部署。
+> **注意**：首次启用此功能需要从零部署（删除旧 Worker 后重新部署），因为需要初始化新的 Durable Object。可通过 `npx wrangler delete cloudssh` 删除旧 Worker，然后运行 `pnpm run deploy` 重新部署。
 
 <a id="development"></a>
 ## 开发说明
 
-本项目分为两部分：
-1. **Frontend (前端)**：在 `frontend/` 目录下，使用 Vite 构建。
-2. **Worker (后端)**：在 `src/` 目录下，包含 Cloudflare Worker 入口与 SSH 协议的核心实现。
+### 项目结构
 
-在本地开发时，可以运行：
-```bash
-npm run dev
+本项目采用 pnpm monorepo 工作区结构：
+
 ```
-此命令将启动 Wrangler 的本地开发环境服务器。
+CloudSSH/
+├── src/                    # 后端源码 (Cloudflare Worker)
+│   ├── ssh/                # SSH 协议纯实现层
+│   └── worker/             # Worker 入口和 Durable Objects
+├── frontend/               # 前端源码 (独立 workspace)
+│   ├── src/                # TypeScript + xterm.js + trzsz
+│   └── package.json        # 前端依赖
+├── scripts/                # 构建脚本
+├── pnpm-workspace.yaml     # pnpm 工作区配置
+└── wrangler.toml           # Cloudflare 部署配置
+```
+
+### 本地开发
+
+1. **安装依赖**
+   ```bash
+   pnpm install
+   ```
+
+2. **启动开发服务器**
+   ```bash
+   pnpm run dev
+   ```
+   此命令将构建前端并启动 Wrangler 本地开发环境。
+
+3. **仅构建前端**
+   ```bash
+   pnpm run build:frontend
+   ```
+
+### 技术栈
+
+| 层级 | 技术 | 说明 |
+|------|------|------|
+| **前端** | TypeScript + Vite + xterm.js | Web 终端模拟器，WebGL 硬件加速 |
+| **UI 框架** | Tailwind CSS (CDN) | 赛博朋克风格暗色主题 |
+| **文件传输** | trzsz.js | 支持 trz/tsz 命令、拖拽上传、断点续传 |
+| **后端** | Cloudflare Workers | Serverless 边缘计算 |
+| **会话管理** | Durable Objects | SSH 会话隔离、Hibernation API |
+| **数据存储** | Durable Objects SQLite | 用户数据、服务器配置 |
+| **包管理** | pnpm (workspace) | Monorepo 依赖管理 |
 
 <a id="license"></a>
 ## 开源协议
@@ -213,4 +288,3 @@ npm run dev
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left" />
  </picture>
 </a>
-

@@ -57,41 +57,86 @@
 
 ### Secure and Reliable
 
-- **End-to-End Encryption**: Complete implementation of the SSH-2.0 protocol, including ECDH key exchange, Ed25519 signature authentication, and AES-256-GCM data encryption.
-- **Security Hardening**: Built-in SSRF protection against IPv6 and reserved IPs, API rate limiting (anti-brute force), and local AES-GCM encryption for your stored server credentials.
+- **End-to-End Encryption**: Complete SSH-2.0 protocol implementation supporting Curve25519-SHA256 (preferred) and ECDH-NISTP256 key exchange, AES-256-GCM (preferred) / AES-128-GCM / AES-256-CTR data encryption, and HMAC-SHA2-256/512 integrity verification.
+- **Multi-Algorithm Host Key Verification**: Supports Ed25519, ECDSA P-256, and RSA signature verification, with SHA-256 fingerprint display on first connection (TOFU mode).
+- **Security Hardening**: Built-in SSRF protection against IPv6 and reserved IPs, API rate limiting (anti-brute force), and local AES-256-GCM encryption for your stored server credentials.
 - **Human Verification**: Supports Cloudflare Turnstile verification to prevent malicious bot abuse.
 - **Isolated Session State**: Leveraging Cloudflare Durable Objects and the Hibernation API, every terminal session runs securely and persistently within its sandbox.
+- **Zero Credential Exposure**: One-Time-Token mechanism ensures passwords/private keys never pass through the frontend, securely flowing entirely within the Worker.
 
 <a id="features"></a>
 ## Features
 
-- **Full SSH Handshake**: Native TypeScript implementation of the SSH transport layer and user authentication protocols.
+- **Pure TypeScript SSH-2.0 Implementation**: Fully self-developed SSH protocol stack, with no dependency on any third-party SSH libraries, implementing all cryptographic operations based on Web Crypto API.
+- **Multi-Algorithm Key Exchange**: Supports Curve25519-SHA256 (preferred) and ECDH-NISTP256 KEX algorithms, compatible with various SSH servers (including Dropbear).
 - **IPv4/IPv6 Dual Stack**: Full support for both IPv4 and IPv6 address connections, including automatic handling of IPv6 bracket notation.
 - **Multiple Auth Methods**: Supports standard SSH password authentication as well as Ed25519 plaintext private key authentication.
-- **MitM Protection (TOFU)**: Automatically extracts and prints the server's Host Key (SHA-256 fingerprint) on the first connection, preventing eavesdropping by malicious nodes.
+- **MitM Protection (TOFU)**: Automatically extracts and prints the server's Host Key (SHA-256 fingerprint) on the first connection, supporting Ed25519/ECDSA/RSA signature verification.
 - **Geek Terminal Experience**: Powered by `@xterm/xterm` and the `@xterm/addon-webgl` hardware acceleration rendering engine, ensuring silky smooth scrolling even with massive log outputs.
 - **Customizable UI**: Switch seamlessly between classic terminal themes like Cyberpunk, Glacier, and Gruvbox, fully optimized for mobile devices.
-- **Native File Transfer**: Integrated with `zmodem.js`. Just run `rz` or `sz` commands in the terminal to easily upload/download files via drag & drop directly in the browser.
+- **Native File Transfer**: Integrated with [trzsz.js](https://github.com/trzsz/trzsz.js), supporting `trz` (upload) / `tsz` (download) commands for file transfer, fully compatible with tmux sessions. Also supports drag-and-drop file upload to the terminal, directory transfer, and resumable transfers. (Requires [trzsz](https://trzsz.github.io/) installed on the remote server)
+- **GitHub OAuth Integration**: Supports GitHub login, allowing users to save and manage frequently used SSH servers for one-click connections.
 
 <a id="architecture"></a>
 ## Architecture
 
+### System Architecture
+
 ```mermaid
 flowchart TB
-    Browser["Browser Client<br/>(TypeScript + xterm.js)"]
-    CF["Cloudflare Edge Network"]
-    DO["Durable Object<br/>(SSH Session Management)"]
-    Server["Target SSH Server<br/>(e.g., Linux VPS)"]
+    subgraph "Browser Client"
+        UI["Frontend UI<br/>TypeScript + xterm.js"]
+        Trzsz["trzsz File Transfer"]
+    end
+    
+    subgraph "Cloudflare Edge Network"
+        Worker["Worker<br/>Routing + API"]
+        SSH_DO["SSHSessionDO<br/>SSH Session Management"]
+        User_DO["UserDBDO<br/>User Data Management"]
+    end
+    
+    subgraph "Target Server"
+        SSH["SSH Server<br/>(OpenSSH/Dropbear)"
+    end
 
-    Browser <-->|"WebSocket<br/>(Frontend UI Input & Terminal Output)"| CF
-    CF <-->|"WebSocket"<br/>Routing & Long-lived Connection| DO
-    DO <-->|"TCP Socket<br/>@cloudflare/sockets"| Server
+    UI <-->|"WebSocket<br/>Terminal I/O"| Worker
+    Trzsz <-->|"trzsz Protocol"| UI
+    Worker <-->|"WebSocket"| SSH_DO
+    Worker <-->|"Internal API"| User_DO
+    SSH_DO <-->|"TCP Socket<br/>@cloudflare/sockets"| SSH
 ```
 
-1. The user enters the host IP, username, and password on the frontend.
+### Core Components
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| **Worker Entry** | `src/worker/index.ts` | HTTP routing, API handling, WebSocket upgrade |
+| **SSHSessionDO** | `src/worker/durable-object.ts` | SSH session lifecycle management, SSRF protection |
+| **UserDBDO** | `src/worker/user-db.ts` | User data, server configs, rate limiting (SQLite) |
+| **SSHSession** | `src/worker/ssh-session.ts` | SSH protocol state machine (connect→version→kex→auth→interactive) |
+| **SSH Protocol Stack** | `src/ssh/*.ts` | Pure TypeScript SSH-2.0 implementation (transport, crypto, auth, channels) |
+| **Frontend Terminal** | `frontend/src/terminal.ts` | xterm.js wrapper, trzsz integration, WebSocket management |
+
+### SSH Protocol Implementation
+
+This project implements a complete SSH-2.0 protocol stack:
+
+| Layer | Implementation | Supported Algorithms |
+|-------|----------------|---------------------|
+| **Key Exchange** | `kex-curve25519.ts` / `kex-ecdh.ts` | curve25519-sha256, ecdh-sha2-nistp256 |
+| **Data Encryption** | `crypto.ts` | aes256-gcm, aes128-gcm, aes256-ctr, aes192-ctr, aes128-ctr |
+| **Integrity** | `crypto.ts` | hmac-sha2-256, hmac-sha2-512, hmac-sha1 |
+| **Host Keys** | `ssh-session.ts` | Ed25519, ECDSA P-256, RSA |
+| **User Auth** | `auth.ts` | Password authentication, Ed25519 public key authentication |
+| **Channel Management** | `channel.ts` | Session channel, PTY, shell, window-change |
+
+### Data Flow
+
+1. The user enters the host IP, username, and password on the frontend (or selects a saved server via GitHub OAuth).
 2. The frontend establishes a WebSocket connection with the backend Durable Object.
-3. The DO receives the credentials and establishes a TCP connection with the target SSH server using `@cloudflare/sockets`.
-4. The DO handles the entire SSH protocol negotiation (key exchange, password auth, etc.) in pure code and forwards the encrypted terminal data to the frontend via WebSocket.
+3. SSHSessionDO receives the credentials and establishes a TCP connection with the target SSH server using `@cloudflare/sockets`.
+4. SSHSession executes the complete SSH protocol negotiation (version exchange → key exchange → authentication → channel open → PTY → Shell).
+5. Encrypted terminal data is bidirectionally forwarded between the frontend and SSH server via WebSocket.
 
 <a id="quick-start"></a>
 ## Quick Deployment
@@ -107,9 +152,10 @@ flowchart TB
 #### Method 1: Deploy via GitHub Integration (Recommended)
 
 1. **Fork this repository** to your GitHub account.
-2. **Configure Domain**: Before deploying, you must modify the custom domain in `wrangler.toml` to your own domain (Note: The domain must be registered or active in Cloudflare beforehand).
-3. **Setup Deployment**: Log in to the Cloudflare dashboard, go to Workers & Pages to connect your GitHub account, and select the forked repository.
-4. **Build Command**: During the deployment configuration, make sure to enter `npm install && npm run build:frontend` as the Build command, then deploy with one click (the build output directory can be left blank).
+2. **Setup Deployment**: Log in to the Cloudflare dashboard, go to Workers & Pages to connect your GitHub account, and select the forked repository.
+3. **Build Command**: During the deployment configuration, make sure to enter `pnpm run build:frontend` as the Build command, then deploy with one click (the build output directory can be left blank).
+4. **Access the App**: After successful deployment, you can access it via the default domain `https://cloudssh.<your-subdomain>.workers.dev`.
+5. **Bind Custom Domain** (Optional): In the Cloudflare Dashboard Workers settings, go to "Triggers" → "Custom Domains" to add your domain.
 
 #### Method 2: Local CLI Deployment
 
@@ -121,7 +167,8 @@ flowchart TB
 
 2. **Install Dependencies**
    ```bash
-   npm install
+   npm install -g pnpm
+   pnpm install
    ```
 
 3. **Login to Cloudflare**
@@ -131,10 +178,12 @@ flowchart TB
 
 4. **One-Click Deploy**
    ```bash
-   npm run deploy
+   pnpm run deploy
    ```
 
 Once deployed, Wrangler will output your Worker URL. Open that URL in your browser to start using your Web SSH terminal.
+
+5. **Bind Custom Domain** (Optional): In the Cloudflare Dashboard Workers settings, go to "Triggers" → "Custom Domains" to add your domain.
 
 #### Optional: Configure Turnstile Human Verification
 
@@ -142,11 +191,9 @@ To prevent malicious bot abuse, it is recommended to enable Cloudflare Turnstile
 
 1. **Create Turnstile Widget**: Log in to [Cloudflare Dashboard](https://dash.cloudflare.com/), go to the Turnstile page and create a new Widget.
 2. **Get Keys**: After creation, you will receive a **Site Key** (public) and a **Secret Key** (private).
-3. **Configure Environment Variables**:
-   - **Method 1 (GitHub)**: In the Cloudflare Dashboard Workers settings, add the following environment variables:
-     - `TURNSTILE_SECRET` = your Secret Key
-     - `TURNSTILE_SITEKEY` = your Site Key
-   - **Method 2 (CLI)**: Uncomment `TURNSTILE_SECRET` and `TURNSTILE_SITEKEY` in `wrangler.toml` and enter your keys.
+3. **Configure Environment Variables**: In the Cloudflare Dashboard Workers settings, go to "Settings" → "Variables and Secrets", add the following environment variables:
+   - `TURNSTILE_SECRET` = your Secret Key (Type: Secret)
+   - `TURNSTILE_SITEKEY` = your Site Key (Type: Text)
 4. **Redeploy**: Run the deployment command to apply the configuration.
 
 > **Note**: Turnstile verification is session-level. After verification, all features are available for the current session. Closing the browser will require re-verification.
@@ -162,38 +209,66 @@ With GitHub OAuth enabled, users can log in with their GitHub account and save/m
    - **Authorization callback URL**: `https://your-domain.com/api/auth/callback`
    - After creation, note the **Client ID**, then click **Generate a new client secret** to get the **Client Secret** (shown only once, save it immediately)
 
-2. **Configure Environment Variables**:
-   - **Method 1 (GitHub)**: In the Cloudflare Dashboard Workers settings, add:
-     - `GITHUB_CLIENT_ID` = your Client ID
-     - `BASE_URL` = `https://your-domain.com` (your deployed domain)
-   - **Method 2 (CLI)**: Uncomment `GITHUB_CLIENT_ID` and `BASE_URL` in `wrangler.toml` and enter your values.
+2. **Configure Environment Variables**: In the Cloudflare Dashboard Workers settings, go to "Settings" → "Variables and Secrets", add the following environment variables:
+   - `GITHUB_CLIENT_ID` = your Client ID (Type: Text)
+   - `BASE_URL` = `https://your-domain.com` (your deployed domain, Type: Text)
+   - `GITHUB_CLIENT_SECRET` = your Client Secret (Type: Secret)
 
-3. **Set Secrets (Sensitive Information)**:
-   - After deploying the project, go to Cloudflare Dashboard → your Worker project (`cloudssh`) → **Settings** → **Variables and Secrets**.
-   - Click **Add** under Environment Variables:
-     - **Type**: Select **Secret** (Important: Do not select Text)
-     - **Variable name**: `GITHUB_CLIENT_SECRET`
-     - **Value**: Paste your Client Secret
-   - Click **Save and deploy**.
-
-4. **Redeploy**: If you just added the variables and are enabling the feature for the first time, you must delete the old deployment and redeploy to initialize the database.
+3. **Redeploy**: If you just added the variables and are enabling the feature for the first time, you must delete the old deployment and redeploy to initialize the database.
 
 > **Note**: Server credentials (passwords/private keys) are encrypted with AES-256-GCM before storage. The local encryption key is automatically generated and safely stored in the database (you can also manually override it by setting `SESSION_SECRET` in environment variables). During connection, credentials never pass through the frontend — they are securely transmitted via a one-time-token mechanism.
 
-> **Important**: Enabling this feature for the first time requires a clean deployment (delete the old Worker first, then redeploy) to initialize the new Durable Object. Use `npx wrangler delete cloudssh` to remove the old Worker, then run `npm run deploy` to redeploy.
+> **Important**: Enabling this feature for the first time requires a clean deployment (delete the old Worker first, then redeploy) to initialize the new Durable Object. Use `npx wrangler delete cloudssh` to remove the old Worker, then run `pnpm run deploy` to redeploy.
 
 <a id="development"></a>
 ## Development
 
-This project consists of two parts:
-1. **Frontend**: Located in the `frontend/` directory, built with Vite.
-2. **Worker**: Located in the `src/` directory, containing the Cloudflare Worker entry point and the core SSH protocol implementation.
+### Project Structure
 
-For local development, you can run:
-```bash
-npm run dev
+This project uses pnpm monorepo workspace structure:
+
 ```
-This command starts Wrangler's local development environment server.
+CloudSSH/
+├── src/                    # Backend source (Cloudflare Worker)
+│   ├── ssh/                # SSH protocol pure implementation layer
+│   └── worker/             # Worker entry and Durable Objects
+├── frontend/               # Frontend source (independent workspace)
+│   ├── src/                # TypeScript + xterm.js + trzsz
+│   └── package.json        # Frontend dependencies
+├── scripts/                # Build scripts
+├── pnpm-workspace.yaml     # pnpm workspace configuration
+└── wrangler.toml           # Cloudflare deployment configuration
+```
+
+### Local Development
+
+1. **Install Dependencies**
+   ```bash
+   pnpm install
+   ```
+
+2. **Start Development Server**
+   ```bash
+   pnpm run dev
+   ```
+   This command builds the frontend and starts the Wrangler local development environment.
+
+3. **Build Frontend Only**
+   ```bash
+   pnpm run build:frontend
+   ```
+
+### Tech Stack
+
+| Layer | Technology | Description |
+|-------|------------|-------------|
+| **Frontend** | TypeScript + Vite + xterm.js | Web terminal emulator, WebGL hardware acceleration |
+| **UI Framework** | Tailwind CSS (CDN) | Cyberpunk-style dark theme |
+| **File Transfer** | trzsz.js | Supports trz/tsz commands, drag-and-drop upload, resumable transfers |
+| **Backend** | Cloudflare Workers | Serverless edge computing |
+| **Session Management** | Durable Objects | SSH session isolation, Hibernation API |
+| **Data Storage** | Durable Objects SQLite | User data, server configurations |
+| **Package Manager** | pnpm (workspace) | Monorepo dependency management |
 
 <a id="license"></a>
 ## License

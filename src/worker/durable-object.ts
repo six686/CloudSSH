@@ -50,7 +50,6 @@ export class SSHSessionDO {
       return new Response('Expected WebSocket', { status: 400 });
     }
 
-    // 检查是否有预填充配置（来自 one-time-token 连接）
     const url = new URL(request.url);
     const configParam = url.searchParams.get('config');
     let prefilledConfig: SSHConnectionConfig | null = null;
@@ -66,13 +65,10 @@ export class SSHSessionDO {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
 
-    // Use Hibernation API for long-lived WebSocket connections
     this.state.acceptWebSocket(server);
 
     if (prefilledConfig) {
-      // 预填充模式：直接发起 SSH 连接，不等待前端凭据
       server.serializeAttachment({ state: 'prefilled' });
-      // 使用 queueMicrotask 确保 WebSocket 就绪后再连接
       queueMicrotask(async () => {
         try {
           await this.initSSHSession(server, prefilledConfig!);
@@ -85,8 +81,6 @@ export class SSHSessionDO {
         }
       });
     } else {
-      // 匿名模式：等待前端发送凭据
-      // Set a timeout for receiving credentials
       const timeout = setTimeout(() => {
         try {
           server.send(JSON.stringify({ type: 'error', message: 'Connection timeout' }));
@@ -104,7 +98,6 @@ export class SSHSessionDO {
     } as any);
   }
 
-  // Hibernation API: called when a WebSocket receives a message
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const session = this.sessions.get(ws);
     if (session) {
@@ -112,7 +105,6 @@ export class SSHSessionDO {
       return;
     }
 
-    // This is the first message (credentials)
     const timeout = this._pendingTimeouts.get(ws);
     if (timeout) {
       clearTimeout(timeout);
@@ -135,7 +127,6 @@ export class SSHSessionDO {
     }
   }
 
-  // Hibernation API: called when a WebSocket is closed
   async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
     const session = this.sessions.get(ws);
     if (session) {
@@ -149,7 +140,6 @@ export class SSHSessionDO {
     }
   }
 
-  // Hibernation API: called when a WebSocket error occurs
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     await this.webSocketClose(ws, 1011, 'Error', false);
   }
