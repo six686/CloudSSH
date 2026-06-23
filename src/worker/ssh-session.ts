@@ -864,13 +864,19 @@ export class SSHSession {
         break;
 
       case SSH_MSG_CHANNEL_FAILURE:
-        if (this.state === 'shell') {
+        if (this.state === 'shell' || this.state === 'shell-requested') {
           this.sendError('PTY 或 Shell 请求被拒绝');
           this.close();
         }
         break;
 
       case SSH_MSG_CHANNEL_DATA: {
+        // 某些 SSH 服务器（如 Dropbear）不会为 shell 请求发送 CHANNEL_SUCCESS，
+        // 而是直接发送 shell 输出。收到 CHANNEL_DATA 说明 shell 已就绪。
+        if (this.state === 'shell-requested') {
+          this.state = 'ready';
+          this.sendStatus('Shell 已就绪');
+        }
         const outputData = this.channel.handleChannelData(payload);
         this.ws.send(outputData.slice().buffer as ArrayBuffer);
         const adjustMsg = this.channel.buildWindowAdjust(outputData.length);
