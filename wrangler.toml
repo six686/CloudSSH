@@ -33,16 +33,16 @@ new_sqlite_classes = ["SSHSessionDO", "UserDBDO"]
 # ========== Test 环境 ==========
 # test 分支部署到独立 worker，共享 DO
 # 自定义域名请在 Cloudflare Dashboard 中手动绑定
-[env.test]
-name = "cloudssh-test"
+# [env.test]
+# name = "cloudssh-test"
 
-[env.test.vars]
-DEBUG_MODE = "true"
+# [env.test.vars]
+# DEBUG_MODE = "true"
 
-[[env.test.durable_objects.bindings]]
-name = "SSH_SESSION"
-class_name = "SSHSessionDO"
+# [[env.test.durable_objects.bindings]]
+# name = "SSH_SESSION"
+# class_name = "SSHSessionDO"
 
-[[env.test.durable_objects.bindings]]
-name = "USER_DB"
-class_name = "UserDBDO"
+# [[env.test.durable_objects.bindings]]
+# name = "USER_DB"
+# class_name = "UserDBDO"
