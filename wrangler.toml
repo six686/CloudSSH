@@ -3,6 +3,7 @@ main = "src/worker/index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
+keep_vars = true
 
 [vars]
 DEBUG_MODE = "false"
