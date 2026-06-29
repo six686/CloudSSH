@@ -30,7 +30,7 @@ class_name = "UserDBDO"
 tag = "v1"
 new_sqlite_classes = ["SSHSessionDO", "UserDBDO"]
 
-# ========== Test 环境 ==========
+# ========== Test 环境 ========== 
 # test 分支部署到独立 worker，共享 DO
 # 自定义域名请在 Cloudflare Dashboard 中手动绑定
 # [env.test]
