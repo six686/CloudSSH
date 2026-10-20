@@ -97,7 +97,7 @@
 - **多算法密钥交换**：支持 Curve25519-SHA256（优先）和 ECDH-NISTP256 两种 KEX 算法，适配各类 SSH 服务器（包括 Dropbear）。
 - **可靠的密钥切换与分包处理**：逐包读取当前加密与认证状态，兼容服务端将 `SSH_MSG_NEWKEYS` 和首个加密包合并在同一 TCP 数据块中返回的情况。
 - **IPv4/IPv6 双栈**：完整支持 IPv4 和 IPv6 地址连接，包括 IPv6 方括号格式自动处理。
-- **多种认证方式**：支持标准 SSH 密码认证、RFC 4256 `keyboard-interactive` 多轮交互认证，以及 OpenSSH 格式的 Ed25519、ECDSA P-256/P-384/P-521 和 RSA 私钥认证。交互认证支持密码、OTP、多字段提示与公钥后的二次验证；服务器提示会在绑定当前连接的安全对话框中展示，已保存密码仅在用户明确选择后代填。RSA 默认使用 RSA-SHA2-256/512，只有显式兼容配置才允许旧 `ssh-rsa` SHA-1。
+- **多种认证方式**：支持标准 SSH 密码认证、RFC 4252 §5.2 `none` 无认证、RFC 4256 `keyboard-interactive` 多轮交互认证，以及 OpenSSH 格式的 Ed25519、ECDSA P-256/P-384/P-521 和 RSA 私钥认证。选择「无认证（none）」后仅提交用户名，不发送密码或私钥；服务器必须明确允许此方式，拒绝时不会回退其他认证。这不是空密码登录；用户名可能就是访问凭据，请勿泄露，并注意本机连接历史会保存用户名。密码模式允许留空并发送空密码；编辑已有密码时留空保留原值，勾选「设为空密码」才清空。交互认证支持直接回车提交空响应、零提示轮次、密码、OTP、多字段提示与公钥后的二次验证；服务器提示会在绑定当前连接的安全对话框中展示，已保存密码仅在用户明确选择后代填。RSA 默认使用 RSA-SHA2-256/512，只有显式兼容配置才允许旧 `ssh-rsa` SHA-1。
 - **SSH 跳板机/堡垒机**：登录用户可以为已保存服务器选择另一台已保存服务器作为跳板。CloudSSH 使用标准 RFC 4254 `direct-tcpip` 通道逐层建立 SSH，不依赖远端安装 `ssh`、`nc` 或 `socat`；支持最多 3 级跳转，最终目标的终端、SFTP 与 AI Agent 均复用完整加密链路。每一跳独立认证和验证路径隔离的主机指纹。
 - **Cloudflare 隧道（Zero Trust Tunnel）**：支持通过 Cloudflare Tunnel（cloudflared）直连无公网 IP、无开放端口的内网服务器（HomeLab、局域网主机等），无需设置或租用跳板机。底层采用官方标准 WebSocket Carrier 架构将 SSH 二进制帧直接穿透传输，支持可选的 Cloudflare Zero Trust Service Token（Client ID / Client Secret）鉴权保护。上层自研 SSH 协议栈、TOFU 指纹、SFTP 文件系统及 AI Agent 全量无缝复用。
 - **一次性 SSH 授权分享**：可选启用登录用户的服务器分享。链接只包含 256 位随机能力凭证，不携带主机、用户名、密码、私钥或跳板信息；凭证仅保存哈希、只能领取一次且具有独立的领取有效期与会话最长时间。分享会话允许终端和 SFTP，服务端强制禁用 AI Agent、OS 检测、主机指纹修改与自动重连；所有者可以实时撤销，并查看仅针对分享会话生成的生命周期、SFTP 操作与终端输出记录。
@@ -120,6 +120,7 @@
 - **终端文本检索与快捷键**：支持使用快捷键 `Ctrl+Shift+F`（或 macOS 下 `Cmd+F`）呼出搜索框，实时检索终端历史日志；支持使用 `Cmd+K` (macOS) / `Ctrl+Shift+K` (Win/Linux) 一键清空屏幕与滚动历史，保留纯 `Ctrl+K` 行编辑能力不冲突。
 - **终端日志一键导出**：支持通过顶栏的下载按钮，将当前活跃会话终端的完整屏幕历史 buffer 一键导出并下载为 `.txt` 文本文件，解决长日志在浏览器下鼠标选取容易卡顿的痛点。
 - **AI 智能助手与运维工作备忘系统**：内置 AI Agent 侧边栏，支持 BYOK（自带 API Key）接入原生无状态 Responses API（`store: false`），原生兼容 OpenAI 官方（GPT-4o、o1、o3-mini 等）及支持 Responses 规范的聚合服务商（如 OpenRouter），不支持传统 Chat Completions 专用接口。由 CloudSSH 在本地持久管理有界上下文、执行事实与结构化服务器记忆，无状态模式避免远端保存敏感服务器会话，同时杜绝上游状态污染。配置面板采用现代化自定义 Combobox 下拉选择器（支持全量展开、即时模糊过滤、一键清空及多套内置主题自适应），支持使用已保存密钥免重复输入 Token 安全拉取模型列表，服务端实现 Base URL 强绑定防凭据外带（Credential Exfiltration）、同源 CSRF 检查与敏感信息脱敏防护。输入框上方提供快捷诊断 Prompt 气泡（Quick Prompt Chips：分析报错、系统负载、网络端口、Docker 状态），一键填充结构化排查提示词并自动聚焦输入框。内置 7 个专业运维工具（执行命令、读取终端上下文、探测环境、进程列表、systemctl 服务管理、Docker 容器管理及用户确认）。支持终端划词“询问 AI 助手”独立上下文附件、代码块一键复制及安全单行命令填入终端。支持 LLM 流式输出与思考过程容器折叠，危险操作多级安全拦截与用户确认。
+  - **Responses 兼容与诊断**：保留标准推理续接字段及 assistant `phase`，不展示或长期保存推理；始终请求 `store:false`，实际留存政策仍需核对服务商。仅对明确报告不支持的可选参数做有界兼容，严格工具/JSON Schema 提示可回退，但本地参数、安全和记忆校验不放松；普通 400、缺失完成事件、工具不完整和已执行操作不会被盲目重试。错误展示调用阶段、白名单错误码/参数及本地请求标识，不输出服务商原始错误正文。AI 设置中可按当前模型调整上下文窗口/输出 Token 预算（默认 64,000/8,192，输出含推理），修改后新建 Agent 会话；模型列表可获取不代表具备全部 Agent 能力。
   - **双轨长期记忆系统**：具备精准时间感知与用户当地时区换算（今天、昨天、N天前）。分为**工作历程（Work Log）**（滚动记录最新运维轨迹，连续排障自动承前启后合并 `update_latest`，防止刷屏碎片化）与**关键知识与凭据备忘（Context Knowledge）**（自动沉淀 Token、密码、端口、路径配置等，后续执行直接带入复用，绝不重复向用户索取；支持键值规范化与原子覆盖更新）。
   - **长短时记忆职责解耦**：会话内摘要专职跟踪当前未完结任务与决策待办，服务器长期记忆专职持久化运维轨迹与配置实体，杜绝冗余重复。
   - **内敛抽屉式交互**：提供独立「工作备忘与记忆」抽屉面板，工作历程卡片支持两行文本截断、悬停完整 Tooltip 与点击展开；机密凭据默认掩码呈现，支持一键切换明文、快捷复制与删除。
@@ -213,38 +214,31 @@ Fork 仓库可以通过内置的 `Sync upstream` GitHub Actions 工作流，定�
 
 所有功能与安全策略均由 Worker 环境变量控制，可在 Cloudflare Dashboard 的 **Settings → Variables and Secrets** 中按需添加（敏感凭据建议选择 **Secret** 加密类型），保存后重新部署即可生效：
 
-| 环境变量                  | 是否必填       | 默认值       | 作用说明                                                                                               | 配置建议与注意事项                                                                                                                                                                                                                     |
-| ------------------------- | -------------- | ------------ | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `IDLE_TIMEOUT`            | 可选           | `30m`        | 用户无操作空闲超时时长。会话超过该时间无键盘输入、SFTP 操作或 AI 任务将自动断开并释放 Durable Object。 | **强烈建议保留默认或按需配置**。防止离开电脑或忘记关闭标签页无休止消耗 Cloudflare 每日 13,000 GB-s 免费额度。支持 `30m`、`1h`、`1800s`、`1800`（纯数字按秒解析）；设为 `0` 可禁用；超时前 60s 会在终端输出预警，敲击任意键可一秒续期。wrangler.toml `[vars]` 随部署默认下发，自定义请改配置文件。 |
-| `GITHUB_CLIENT_ID`        | 启用登录时必填 | 无           | GitHub OAuth 应用的 Client ID，用于开启多用户登录与已保存服务器/命令片段云端管理。                     | 公开 ID。需与 `GITHUB_CLIENT_SECRET` 和 `BASE_URL` 配合使用。未配置时整个登录入口自动隐藏，不影响匿名 SSH 连接。                                                                                                                       |
-| `GITHUB_CLIENT_SECRET`    | 启用登录时必填 | 无           | GitHub OAuth 应用的 Client Secret，用于服务端向 GitHub 安全换取用户访问令牌。                          | **敏感凭据，务必在 Cloudflare Dashboard 中设为 Secret 类型**。严禁泄露或直接提交到公共代码仓库。                                                                                                                                       |
-| `BASE_URL`                | 启用登录时必填 | 无           | 部署站点的完整公网访问根地址（如 `https://ssh.example.com`），用于生成 OAuth 授权回调跳转。            | 域名必须与 GitHub OAuth App 中的 Authorization callback URL 完全一致，末尾**不要**加斜杠 `/`。未配置时降级使用请求上下文 Host。                                                                                                        |
-| `GITHUB_ALLOWED_USER_IDS` | 可选           | 无（不限制） | 允许登录系统的 GitHub **数字用户 ID** 白名单列表，多个 ID 以英文逗号分隔（如 `83105156,6236783`）。    | **私有化部署核心防线**。未配置时任何 GitHub 用户均可登录；一旦配置，仅白名单用户允许登录（fail-closed 机制）。数字 ID 可访问 `https://api.github.com/users/<username>` 查看 `id` 字段获取。                                            |
-| `ADMIN_PASSWORD_HASH`    | 启用密码登录时必填 | 无           | 单管理员密码登录凭据（格式：`pbkdf2$sha256$<迭代数>$<盐>$<校验值>`，用自定义密码在浏览器内生成——匿名实例页尾入口或任意实例 `#password-setup` 路由——或本地 `pnpm run hash-password`）。非空即启用密码模式：与 GitHub 登录互斥且优先级更高，全实例仅本地管理员一个账号，功能与 GitHub 登录完全一致。 | **敏感凭据，务必设为 Secret 类型**。置空/删除即刻退回 GitHub 登录模式（GitHub 配置与数据零影响）；换新值 = 修改密码（所有已登录会话立即失效）。密码模式不改变匿名 SSH 行为，需强制登录请配合 `REQUIRE_GITHUB_AUTH=true`；公网部署建议同时开启 Turnstile 防爆破。 |
-| `REQUIRE_GITHUB_AUTH`     | 可选           | `false`      | 是否强制登录后才可使用 SSH 终端（GitHub 或单管理员密码会话均满足）。设为 `true` 时彻底禁用匿名直连入口。 | **公网部署防被蹭推荐开启**。若不希望未授权访客将你的 Worker 用作公开 SSH 代理节点，建议配置为 `true` 并配合白名单使用。wrangler.toml `[vars]` 随部署默认下发，自定义请改配置文件。                                                                                                                |
-| `TURNSTILE_SITEKEY`       | 可选           | 无           | Cloudflare Turnstile 人机验证的前端公开 Site Key。                                                     | 公开密钥。与 `TURNSTILE_SECRET` 配合使用，在未配置或配置任一为空时人机验证功能自动禁用。                                                                                                                                               |
-| `TURNSTILE_SECRET`        | 可选           | 无           | Cloudflare Turnstile 人机验证的服务端 Secret Key，用于校验前端回传的人机验证 Token。                   | **敏感密钥，建议保存为 Secret 类型**。开启后可有效拦截自动化扫描脚本、批量机器人和恶意滥用。默认不部署（自行选择加入）；经 Git/CLI 部署的实例建议用 Dashboard Secret 类型配置——Secret 不受 wrangler 部署覆盖。                                                                                                                                           |
-| `ENABLE_SSH_SHARING`      | 可选           | `true`（随部署默认启用） | 是否开启一次性受控 SSH 分享功能。开启后登录用户可为已保存服务器生成临时受控分享链接。 | wrangler.toml `[vars]` 已默认置 `true`，Git 集成/CLI 部署开箱即用；关闭请改 wrangler.toml 为 `false`。分享链路仅支持受限终端与可选 SFTP，受完整操作审计记录监督，禁止使用 AI Agent、修改服务器元数据或跨网络重连；Dashboard 手动上传部署不受 `[vars]` 影响，如需启用自行添加该变量。 |
-| `STRICT_HOST_KEY_VERIFY`  | 可选           | `true`       | SSH 远端主机公钥签名严格校验开关。默认 `true`（fail-closed，签名不合法或算法不支持时立即终止握手）。   | **生产环境务必保持默认 `true`**。仅在本地调试、测试自签或老旧不兼容服务器且明确知晓安全风险时才允许设为 `false`。wrangler.toml `[vars]` 随部署默认下发，自定义请改配置文件。                                                                                                                      |
-| `DEBUG_MODE`              | 可选           | `false`      | 详细调试模式开关。设为 `true` 时在 API 响应和前端终端中输出底层协议握手与诊断日志。                    | `wrangler.toml` 默认声明为 `false`。仅在排查连接握手故障时临时开启，生产环境日常运行建议保持 `false`。                                                                                                                                 |
+| 环境变量                  | 是否必填           | 默认值                   | 作用说明                                                                                                                                                                                                                                                                                           | 配置建议与注意事项                                                                                                                                                                                                                                                                                |
+| ------------------------- | ------------------ | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IDLE_TIMEOUT`            | 可选               | `30m`                    | 用户无操作空闲超时时长。会话超过该时间无键盘输入、SFTP 操作或 AI 任务将自动断开并释放 Durable Object。                                                                                                                                                                                             | **强烈建议保留默认或按需配置**。防止离开电脑或忘记关闭标签页无休止消耗 Cloudflare 每日 13,000 GB-s 免费额度。支持 `30m`、`1h`、`1800s`、`1800`（纯数字按秒解析）；设为 `0` 可禁用；超时前 60s 会在终端输出预警，敲击任意键可一秒续期。wrangler.toml `[vars]` 随部署默认下发，自定义请改配置文件。 |
+| `GITHUB_CLIENT_ID`        | 启用登录时必填     | 无                       | GitHub OAuth 应用的 Client ID，用于开启多用户登录与已保存服务器/命令片段云端管理。                                                                                                                                                                                                                 | 公开 ID。需与 `GITHUB_CLIENT_SECRET` 和 `BASE_URL` 配合使用。未配置时整个登录入口自动隐藏，不影响匿名 SSH 连接。                                                                                                                                                                                  |
+| `GITHUB_CLIENT_SECRET`    | 启用登录时必填     | 无                       | GitHub OAuth 应用的 Client Secret，用于服务端向 GitHub 安全换取用户访问令牌。                                                                                                                                                                                                                      | **敏感凭据，务必在 Cloudflare Dashboard 中设为 Secret 类型**。严禁泄露或直接提交到公共代码仓库。                                                                                                                                                                                                  |
+| `BASE_URL`                | 启用登录时必填     | 无                       | 部署站点的完整公网访问根地址（如 `https://ssh.example.com`），用于生成 OAuth 授权回调跳转。                                                                                                                                                                                                        | 域名必须与 GitHub OAuth App 中的 Authorization callback URL 完全一致，末尾**不要**加斜杠 `/`。未配置时降级使用请求上下文 Host。                                                                                                                                                                   |
+| `GITHUB_ALLOWED_USER_IDS` | 可选               | 无（不限制）             | 允许登录系统的 GitHub **数字用户 ID** 白名单列表，多个 ID 以英文逗号分隔（如 `83105156,6236783`）。                                                                                                                                                                                                | **私有化部署核心防线**。未配置时任何 GitHub 用户均可登录；一旦配置，仅白名单用户允许登录（fail-closed 机制）。数字 ID 可访问 `https://api.github.com/users/<username>` 查看 `id` 字段获取。                                                                                                       |
+| `ADMIN_PASSWORD_HASH`     | 启用密码登录时必填 | 无                       | 单管理员密码登录凭据（格式：`pbkdf2$sha256$<迭代数>$<盐>$<校验值>`，用自定义密码在浏览器内生成——匿名实例页尾入口或任意实例 `#password-setup` 路由——或本地 `pnpm run hash-password`）。非空即启用密码模式：与 GitHub 登录互斥且优先级更高，全实例仅本地管理员一个账号，功能与 GitHub 登录完全一致。 | **敏感凭据，务必设为 Secret 类型**。置空/删除即刻退回 GitHub 登录模式（GitHub 配置与数据零影响）；换新值 = 修改密码（所有已登录会话立即失效）。密码模式不改变匿名 SSH 行为，需强制登录请配合 `REQUIRE_GITHUB_AUTH=true`；公网部署建议同时开启 Turnstile 防爆破。                                  |
+| `REQUIRE_GITHUB_AUTH`     | 可选               | `false`                  | 是否强制登录后才可使用 SSH 终端（GitHub 或单管理员密码会话均满足）。设为 `true` 时彻底禁用匿名直连入口。                                                                                                                                                                                           | **公网部署防被蹭推荐开启**。若不希望未授权访客将你的 Worker 用作公开 SSH 代理节点，建议配置为 `true` 并配合白名单使用。wrangler.toml `[vars]` 随部署默认下发，自定义请改配置文件。                                                                                                                |
+| `TURNSTILE_SITEKEY`       | 可选               | 无                       | Cloudflare Turnstile 人机验证的前端公开 Site Key。                                                                                                                                                                                                                                                 | 公开密钥。与 `TURNSTILE_SECRET` 配合使用，在未配置或配置任一为空时人机验证功能自动禁用。                                                                                                                                                                                                          |
+| `TURNSTILE_SECRET`        | 可选               | 无                       | Cloudflare Turnstile 人机验证的服务端 Secret Key，用于校验前端回传的人机验证 Token。                                                                                                                                                                                                               | **敏感密钥，建议保存为 Secret 类型**。开启后可有效拦截自动化扫描脚本、批量机器人和恶意滥用。默认不部署（自行选择加入）；经 Git/CLI 部署的实例建议用 Dashboard Secret 类型配置——Secret 不受 wrangler 部署覆盖。                                                                                    |
+| `ENABLE_SSH_SHARING`      | 可选               | `true`（随部署默认启用） | 是否开启一次性受控 SSH 分享功能。开启后登录用户可为已保存服务器生成临时受控分享链接。                                                                                                                                                                                                              | wrangler.toml `[vars]` 已默认置 `true`，Git 集成/CLI 部署开箱即用；关闭请改 wrangler.toml 为 `false`。分享链路仅支持受限终端与可选 SFTP，受完整操作审计记录监督，禁止使用 AI Agent、修改服务器元数据或跨网络重连；Dashboard 手动上传部署不受 `[vars]` 影响，如需启用自行添加该变量。              |
+| `STRICT_HOST_KEY_VERIFY`  | 可选               | `true`                   | SSH 远端主机公钥签名严格校验开关。默认 `true`（fail-closed，签名不合法或算法不支持时立即终止握手）。                                                                                                                                                                                               | **生产环境务必保持默认 `true`**。仅在本地调试、测试自签或老旧不兼容服务器且明确知晓安全风险时才允许设为 `false`。wrangler.toml `[vars]` 随部署默认下发，自定义请改配置文件。                                                                                                                      |
+| `DEBUG_MODE`              | 可选               | `false`                  | 详细调试模式开关。设为 `true` 时在 API 响应和前端终端中输出底层协议握手与诊断日志。                                                                                                                                                                                                                | `wrangler.toml` 默认声明为 `false`。仅在排查连接握手故障时临时开启，生产环境日常运行建议保持 `false`。                                                                                                                                                                                            |
 
 > **配置建议与补充说明**：
 >
 > 1. **Secret 安全存储**：在 Cloudflare Dashboard 的 _Settings → Variables and Secrets_ 中，强烈建议将所有包含密码、Secret、Key 等敏感凭据的变量统一选择为 **Secret** 类型。Secrets 存储在 Cloudflare 独立加密存储层中，重新构建和部署 Worker 时不会被代码覆盖。
-> 2. **凭据存储边界**：已保存的 SSH 凭据、AI API key、隧道 Service Token 与敏感服务器记忆使用 AES-GCM 存储，但加密根密钥位于同一 UserDBDO SQLite 的 `system_config.encryption_secret`。这仅避免凭据列直接存明文，不抵御含密钥的整库泄露、数据库读权限或 Worker 代码执行权限失陷；并非独立 Secret/KMS 保护。
-> 3. **预留变量说明**：代码中保留了 `MAX_CONNECTIONS` 环境变量接口定义，当前版本暂未读取生效，请勿依赖。
->
-> 4. **终端输出积压保护**：stdout 与 stderr 共享 4MiB 未接收确认额度；超限或有积压且 60s 无有效客户端确认进展时正常关闭会话，禁止自动重连。它不是累计输出上限，也不限制畅通链路持续输出的费用；确认仅代表 WebSocket 已接收，不代表终端渲染或文件落盘完成。升级后请刷新已有页面，旧前端不发送确认也会触发保护。Agent 命令确认也要求回传新的一次性确认 ID，旧页面无法批准；等待确认期间仍受 `IDLE_TIMEOUT` 约束（`0` 明确禁用）。
->
-> 5. **SFTP 目录删除预算**：每目录最多 10,000 条及 8MiB 条目估算内存；整棵树共享 50,000 条、16MiB 累计条目估算内存、100,000 次请求、深度 64 与 5 分钟预算。截断或预算耗尽会明确失败，不对截断目录继续部分删除；此前已完成的删除不会回滚。连续空目录批次和异常报文也会失败收敛，句柄清理最多额外尝试 5 秒。
->
-> 6. **wrangler 部署的变量权威性**：经 Git 集成/CLI（wrangler）部署的实例以 `wrangler.toml` 为配置权威——Dashboard 中的同名普通变量会在部署时被覆盖，**Secret 类型不受影响**。`IDLE_TIMEOUT` / `REQUIRE_GITHUB_AUTH` / `ENABLE_SSH_SHARING` / `STRICT_HOST_KEY_VERIFY` 已随 `[vars]` 默认下发，如需自定义请直接修改 `wrangler.toml`；`TURNSTILE` 与 `ADMIN_PASSWORD_HASH` 等按需变量建议在 Dashboard 中以 Secret 类型维护。
+> 2. **预留变量说明**：代码中保留了 `MAX_CONNECTIONS` 环境变量接口定义，当前版本暂未读取生效，请勿依赖。
 
 #### 可选：启用单管理员密码登录（替代 GitHub OAuth）
 
 不想配置 GitHub OAuth？可以用你自定义的密码登录，且全实例仅你一个账号：
 
-1. **生成哈希**：输入自定义密码（≥10 位）并确认 → 点击「生成哈希」→ 复制结果。**密码全程不离开浏览器**，无需本地安装任何工具（有 Node 环境也可用 `pnpm run hash-password`）。进入生成器的方式：
+1. **生成哈希**：输入自定义密码（≥10 位）并确认 → 点击「生成哈希」→ 复制结果。**密码全程不离开浏览器**，无需本地安装任何工具。进入生成器的方式：
    - 全新部署（未配置任何登录方式）：打开站点，在认证表单底部点击「**管理员密码登录设置**」；
    - 已配置 GitHub 登录的实例（含 `REQUIRE_GITHUB_AUTH=true` 强制登录）：浏览器直接打开 `https://你的域名/#password-setup`，无需改动任何既有变量；
    - 修改密码（轮换）：同样打开 `#password-setup` 重新生成，替换 Dashboard 变量即可。
@@ -306,7 +300,7 @@ Fork 仓库可以通过内置的 `Sync upstream` GitHub Actions 工作流，定�
 
 1. **重新部署**：保存环境变量后重新部署当前 Worker。仓库中的 Durable Object migration 会负责初始化所需类和数据库，不需要删除已有 Worker。
 
-> **访问策略说明**：修改 `GITHUB_ALLOWED_USER_IDS` 后，已签发 session 会在下一次请求时重新检查并立即失效；已建立的 SSH WebSocket 不会被主动中断。`REQUIRE_GITHUB_AUTH=true` 依赖 GitHub OAuth，请同时正确配置 Client ID、Client Secret 和 `BASE_URL`。
+> **访问策略说明**：修改 `GITHUB_ALLOWED_USER_IDS` 后，已签发 session 会在下一次请求时重新检查并立即失效；`REQUIRE_GITHUB_AUTH=true` 依赖 GitHub OAuth，请同时正确配置 Client ID、Client Secret 和 `BASE_URL`。
 
 ##### 使用一次性 SSH 分享
 
@@ -349,13 +343,7 @@ SSH 跳转不需要额外环境变量，但必须启用 GitHub OAuth 并使用�
   - **支持的服务商**：OpenAI 官方（如 `https://api.openai.com/v1`，模型如 `gpt-4o`、`o1`、`o3-mini` 等）、OpenRouter 以及其他遵循标准 Responses API 规范的聚合服务商。
   - **暂不支持的服务商**：目前仅提供传统 Chat Completions（`/v1/chat/completions`）的平台（如 DeepSeek 官方直连、阿里云百炼 DashScope、月之暗面 Kimi 等），直接请求 `/responses` 将返回 HTTP 404/405。
   - **免升级建议**：如果您的当前业务环境强依赖仅支持 Chat Completions 的国内模型或网关，**建议暂时维持 v2.5.5 版本**，等待上游服务商适配 Responses 规范。
-- **配置与升级指引**：在 AI 设置中填写 HTTPS API 根地址（如 `https://api.openai.com/v1`）或完整 `/responses` 地址、模型及密钥；旧 `/chat/completions` 地址需手动改为根地址。更换地址必须重新明确填写密钥（防凭据外带安全机制，禁止将已绑定的密钥静默转发至新目标）。
-- **能力要求**：提供商和模型必须支持原生 Responses API：强制无状态运行（`store: false`）、函数工具、流式 Responses 事件及 JSON Schema 结构化输出。获取 `/models` 成功不是上述能力的证明。
-- **数据留存与隐私保护**：全部请求（主任务、上下文压缩、记忆提炼）均强制携带 `store: false`，避免敏感的终端会话、命令执行结果或参数被远端提供商长期存储。所有交互历史和检查点均由 CloudSSH 在本地受控维护。
-- **预算与检查点机制**：上下文预算默认 64,000 token，单次输出预算 8,192 token（包含推理）；有 usage 时按实测用量判断，否则使用保守估算。达到预算后通过结构化检查点开启干净的续接段，历史执行事实完好保留，不篡改已执行命令。
-- **编辑分支与操作事实**：编辑检查点最多保留最近 64 轮，并受 512K 字符总预算限制。编辑重发会从该轮开始前分支，**不会撤销服务器上已经发生的操作**；指针失效、配置改变或旧编辑位置不可用时请新建会话，不自动重放命令。
-- **执行安全防线**：流中断、工具参数不完整和模型拒绝/失败不会触发残缺命令。用户停止后的已执行操作被确切标记为真实状态或“状态未知”，继续前须核查；正文输出结束不代表任务结束。
-- **审计与日志**：Worker 日志只记录用量元数据：主调用与检查点的累计输入/缓存/输出/推理 token，以及独立记忆调用用量，不记录请求正文或 API 密钥。
+- **配置与升级指引**：在 AI 设置中填写 HTTPS API 根地址（如 `https://api.openai.com/v1`）或完整 `/responses` 地址、模型及密钥；旧 `/chat/completions` 地址需手动改为根地址。更换地址必须重新填写密钥。
 
 <a id="development"></a>
 
@@ -487,13 +475,13 @@ test 分支（开发/测试）  ──合并──>  main 分支（生产）
 
 感谢以下贡献者对 CloudSSH 的代码、兼容性和用户体验所做的贡献：
 
-| 贡献者                                               | 主要贡献                                                                                                                 |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| [TanXin (@newbietan)](https://github.com/newbietan)  | 项目发起与持续维护；Cloudflare Serverless、SSH/SFTP、AI Agent、安全体系、主题系统及工程化建设                            |
-| [David xu (@xqdoo00o)](https://github.com/xqdoo00o)  | Dropbear 兼容、trzsz 文件传输迁移、PTY 尺寸处理，以及会话退出与重连交互优化                                              |
-| [vonl1 (@vonl1)](https://github.com/vonl1)           | 终端选区自动复制、兼容 Vim 的右键粘贴体验、服务器 IPv4/IPv6 掩码与完整地址快捷复制，以及服务器操作系统自动识别与品牌图标 |
-| [Leon Xu (@xuthuslei)](https://github.com/xuthuslei) | 修复 `SSH_MSG_NEWKEYS` 与首个加密包同批到达时的加密状态切换和数据包解析兼容问题；修复 v1.11.0 跳板认证时序回归（#108）   |
-| [DAVID TB (@tbdavid2019)](https://github.com/tbdavid2019) | 贡献繁体中文（台灣）界面与本地化词典，扩展前端语言切换与主题编辑器繁中支持（#147）   |
+| 贡献者                                                    | 主要贡献                                                                                                                 |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| [TanXin (@newbietan)](https://github.com/newbietan)       | 项目发起与持续维护；Cloudflare Serverless、SSH/SFTP、AI Agent、安全体系、主题系统及工程化建设                            |
+| [David xu (@xqdoo00o)](https://github.com/xqdoo00o)       | Dropbear 兼容、trzsz 文件传输迁移、PTY 尺寸处理，以及会话退出与重连交互优化                                              |
+| [vonl1 (@vonl1)](https://github.com/vonl1)                | 终端选区自动复制、兼容 Vim 的右键粘贴体验、服务器 IPv4/IPv6 掩码与完整地址快捷复制，以及服务器操作系统自动识别与品牌图标 |
+| [Leon Xu (@xuthuslei)](https://github.com/xuthuslei)      | 修复 `SSH_MSG_NEWKEYS` 与首个加密包同批到达时的加密状态切换和数据包解析兼容问题；修复 v1.11.0 跳板认证时序回归（#108）   |
+| [DAVID TB (@tbdavid2019)](https://github.com/tbdavid2019) | 贡献繁体中文（台灣）界面与本地化词典，扩展前端语言切换与主题编辑器繁中支持（#147）                                       |
 
 名单及贡献说明依据 Git 提交历史与已接收的 Pull Request 整理；同一贡献者在历史中可能使用过不同的 Git 作者名称或邮箱。完整记录请参阅 [GitHub Contributors](https://github.com/newbietan/CloudSSH/graphs/contributors)。欢迎通过 Issue 和 Pull Request 参与项目建设。
 
