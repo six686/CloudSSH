@@ -17,7 +17,6 @@ const SERVER_MESSAGE_KEYS: Readonly<Record<string, TranslationKey>> = {
   'Invalid share link': 'share.claimFailed',
   'Invalid request body': 'share.claimFailed',
   'Invalid device public key': 'share.claimFailed',
-  'SSH sharing is disabled': 'share.errorSharingDisabled',
   'Share service unavailable': 'share.errorServiceUnavailable',
   'Connection ticket has already been used': 'share.errorAlreadyUsed',
   'Connection ticket expired': 'share.errorLinkExpired',
@@ -40,4 +39,42 @@ export function localizedApiError(payload: unknown, fallbackKey: TranslationKey)
   const mapped = SERVER_MESSAGE_KEYS[message];
   // 命中映射表时必须经 t() 翻译，直接返回键名会泄漏到界面（回归见 E2E share-session）
   return mapped ? t(mapped) : message;
+}
+
+const HTML_DOCUMENT = /^\s*(?:<!doctype html|<html)\b/i;
+
+/**
+ * 读取 JSON API 响应。Cloudflare Access 登录页、挑战页或本站 HTML 回退
+ * 都以 `<!DOCTYPE html>` 开头；直接 `response.json()` 会把解析异常原文甩到界面。
+ */
+export async function readApiJson<T>(response: Response, fallbackKey: TranslationKey): Promise<T> {
+  if (
+    response.type === 'opaqueredirect' ||
+    (response.status >= 300 && response.status < 400)
+  ) {
+    throw new Error(t('api.htmlResponse'));
+  }
+
+  const text = await response.text();
+  const trimmed = text.trim();
+  if (HTML_DOCUMENT.test(trimmed)) {
+    throw new Error(t('api.htmlResponse'));
+  }
+
+  let payload: unknown = null;
+  if (trimmed) {
+    try {
+      payload = JSON.parse(trimmed);
+    } catch {
+      throw new Error(t('api.invalidResponse', { status: String(response.status || 0) }));
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(localizedApiError(payload, fallbackKey));
+  }
+  if (payload === null || typeof payload !== 'object') {
+    throw new Error(t('api.invalidResponse', { status: String(response.status || 0) }));
+  }
+  return payload as T;
 }

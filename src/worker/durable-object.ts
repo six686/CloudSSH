@@ -9,6 +9,7 @@ import {
   buildResumeChallengeMessage,
   RESUME_CHALLENGE_MAX_CLOCK_SKEW_MS,
 } from '../share-resume-schema';
+import { isRestrictedTcpPort } from '../tcp-port-policy';
 import { checkHostResolved } from './dns-check';
 import { SSHSession } from './ssh-session';
 import { isValidTunnelHostname, TunnelWebSocketStream } from './tunnel-stream';
@@ -112,6 +113,14 @@ export class SSHSessionDO {
       url = new URL(request.url);
     } catch {
       return new Response('Invalid request', { status: 400 });
+    }
+    if (url.pathname === '/internal/mcp-context' && request.method === 'POST') {
+      const input = await request.json<{ userId: number; routeKey: string; serverId: number; enabled?: boolean; inspect?: boolean; lastLines?: number }>();
+      for (const session of this.sessions.values()) {
+        const result = session.mcpContext(input);
+        if (result) return Response.json(result);
+      }
+      return Response.json({ error: 'context_unavailable' }, { status: 404 });
     }
     if (url.pathname === '/internal/revoke-share' && request.method === 'POST') {
       const body = await request.json<{ shareId?: string }>();
@@ -316,6 +325,7 @@ export class SSHSessionDO {
       if (config.authMethod === 'none') {
         config.password = '';
         delete config.privateKey;
+        delete config.certificate;
       }
 
       const pendingSessionName = this.pendingSessionNames.get(ws);
@@ -422,6 +432,11 @@ export class SSHSessionDO {
       return resumeReject(404, 'Session expired or not found');
     }
 
+    const policy = detached.session.getSessionPolicy();
+    if (request.headers.get('x-ssh-share-resume-only') === 'true' && policy?.source !== 'share') {
+      return resumeReject(401, 'Authentication required');
+    }
+
     // 容忍一代旧 token：弱网下轮换帧可能随新连接一起丢失，客户端会携带
     // 上一代 token 重试；直接锁死会造成永久 403。新旧两代均需过后续校验。
     const currentResumeToken = detached.resumeToken;
@@ -436,7 +451,6 @@ export class SSHSessionDO {
     }
 
     // 分享会话附加策略校验：绝对过期复核 + 设备绑定挑战验签。
-    const policy = detached.session.getSessionPolicy();
     if (policy?.source === 'share') {
       if (Date.now() >= policy.sessionExpiresAt) {
         // 宽限期内到达分享会话绝对结束时间：立即终结，不再允许恢复。
@@ -634,10 +648,6 @@ export class SSHSessionDO {
         throw new Error('Cloudflare 隧道连接不支持跳板机');
       }
 
-      const BLOCKED_PORTS = [
-        23, 80, 443, 25, 465, 587, 110, 143, 993, 995, 3306, 5432, 6379, 9200, 11211, 27017, 5060,
-      ];
-
       const debugMode = this.env.DEBUG_MODE === 'true';
 
       let transport: any;
@@ -749,7 +759,7 @@ export class SSHSessionDO {
           if (!Number.isInteger(node.port) || node.port < 1 || node.port > 65535) {
             throw new Error('端口必须是 1-65535 之间的整数');
           }
-          if (BLOCKED_PORTS.includes(node.port)) {
+          if (isRestrictedTcpPort(node.port)) {
             throw new Error(`端口 ${node.port} 存在安全风险，已被禁止连接`);
           }
         }
@@ -766,12 +776,6 @@ export class SSHSessionDO {
       const colo = this.websocketColos.get(ws) || 'UNKNOWN';
       this.websocketColos.delete(ws);
 
-      // Capability links never inherit the ordinary-session escape hatch: every
-      // hop must prove possession of its already trusted host key.
-      const strictVerify =
-        config.sessionPolicy?.source === 'share'
-          ? true
-          : this.env.STRICT_HOST_KEY_VERIFY !== 'false';
       const pendingSize = this.pendingTerminalSizes.get(ws);
       if (pendingSize) {
         config.cols = pendingSize.cols;
@@ -803,7 +807,6 @@ export class SSHSessionDO {
           ws,
           transport,
           { ...hop, sessionPolicy: undefined },
-          strictVerify,
           debugMode,
           undefined,
           this.env,
@@ -847,7 +850,6 @@ export class SSHSessionDO {
         ws,
         transport,
         finalConfig,
-        strictVerify,
         debugMode,
         sftpAttachUrl,
         this.env,

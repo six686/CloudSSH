@@ -1,3 +1,5 @@
+import { emptyAgentSessionState } from '../agent-session-state';
+import { MCP_CONTEXT_TTL_MS } from '../mcp-schema';
 import {
   getCipherSpec,
   getMacAlgorithmsForCipher,
@@ -13,12 +15,18 @@ import {
   SSHChannel,
 } from '../ssh/channel';
 import {
-  base64UrlEncodeUnsigned,
-  convertSSHECDSASig,
   SSHAESCTRCipher,
   SSHAESGCMCipher,
   SSHHMAC,
 } from '../ssh/crypto';
+import { SshExecError } from '../ssh/exec-error';
+import {
+  assertHostKeyAlgorithm,
+  fingerprintHostKey,
+  parsePresentedHostKey,
+  type PresentedHostKey,
+  verifySSHSignature,
+} from '../ssh/host-key';
 import {
   filterExtInfo,
   KEXInitBuilder,
@@ -31,8 +39,9 @@ import { ECDHKeyExchange } from '../ssh/kex-ecdh';
 import { KeyDerivation } from '../ssh/keys';
 import { nextSequenceNumber, SSHPacketBuilder, SSHPacketParser } from '../ssh/packet';
 import { SSHTransport } from '../ssh/transport';
+import { concat, encodeString, readUint32 } from '../ssh/utils';
 import type { Env } from '../types';
-import type { AgentTaskCheckpoint } from '../agent-task-schema';
+import { normalizeResponseDiagnostics, responseErrorDebugMessage } from '../agent-response-diagnostics';
 import { DetachedSessionBuffer } from './ssh-detached-buffer';
 import { KeyboardInteractiveAuthHandler, type PendingAuthChallenge } from './ssh-interactive-auth';
 import { parseIdleTimeout } from './idle-timeout';
@@ -75,13 +84,21 @@ import {
 import { AgentCore } from './agent/core';
 import { AgentExecChannel } from './agent/exec-channel';
 import { TerminalContext } from './agent/terminal-context';
-import type { AgentMemoryProvider, UnifiedServerMemory } from './agent/types';
+import type { AgentMemoryProvider } from './agent/types';
+import { createAgentMemoryProvider } from './agent/memory-provider';
 import { DirectTcpipStream } from './direct-tcpip-stream';
 import { detectAndPersistRemoteOS } from './os-detect';
 import { SFTPHandler } from './sftp-handler';
 
 const LOCAL_WINDOW_ADJUST_THRESHOLD = 512 * 1024;
-const KEEPALIVE_REQUEST_NAME = new TextEncoder().encode('keepalive@openssh.com');
+const KEEPALIVE_REQUEST = concat(
+  Uint8Array.of(SSH_MSG_GLOBAL_REQUEST),
+  encodeString('keepalive@openssh.com'),
+  Uint8Array.of(1) // want_reply
+);
+const KEEPALIVE_INTERVAL_MS = 25_000;
+const KEEPALIVE_REPLY_TIMEOUT_MS = 10_000;
+const MAX_KEEPALIVE_FAILURES = 3;
 const MAX_PARTIAL_AUTHENTICATION_STAGES = 8;
 // Socket 写超时（write deadline）：弱网 TCP 半开时 write() 可能永不 settle，
 // 超时即关闭底层 socket 会拒绝所有 pending 写，读循环随之走正常 close() 流程。
@@ -94,8 +111,19 @@ const IDLE_WATCHDOG_CHECK_MS = 10_000;
 const IDLE_WATCHDOG_GRACE_MS = 60_000;
 // 浏览器→服务器终端输入队列上限：浏览器卡死时防止 channelDataQueue 无界堆积。
 const MAX_INPUT_QUEUE_BYTES = 4 * 1024 * 1024;
+const MAX_SSH_VERSION_PREAMBLE_BYTES = 64 * 1024;
+const MAX_SSH_IDENTIFICATION_BYTES = 255; // RFC 4253 §4.2, including CRLF.
 
 type ActiveAuthMethod = 'none' | 'password' | 'publickey' | 'keyboard-interactive';
+
+interface KeepaliveProbe {
+  sequence: number | null; // null while queued: no reply can belong to this probe yet.
+  sentAt: number;
+  timeout?: ReturnType<typeof setTimeout>;
+}
+
+/** Browser sockets and headless operation sinks share only lifecycle notifications. */
+export type SSHSessionClient = Pick<WebSocket, 'send' | 'close' | 'readyState'>;
 
 export interface SSHSessionOptions {
   /** Tunnel hops authenticate without allocating a PTY, Shell, SFTP, or Agent. */
@@ -120,11 +148,11 @@ export interface SSHSessionOptions {
 export class SSHSession {
   private readonly textEncoder = new TextEncoder();
   private readonly textDecoder = new TextDecoder();
-  private ws: WebSocket;
+  private ws: SSHSessionClient;
+  private mcpContextExpiresAt = 0;
   private sftpWs: WebSocket | null = null;
   private socket: any;
   private config: SSHConnectionConfig;
-  private strictHostKeyVerify: boolean;
   private sftpAttachUrl?: string;
 
   private transport: SSHTransport;
@@ -155,6 +183,8 @@ export class SSHSession {
   private kexInitRemote: Uint8Array | null = null;
 
   private negotiatedKexAlgorithm: string | null = null;
+  private negotiatedHostKeyAlgorithm: string | null = null;
+  private acceptedHostKeyFingerprint: string | null = null;
   private ecdhKeyPair: CryptoKeyPair | null = null;
   private curve25519KeyPair: Curve25519KeyPair | null = null;
   private kexRawPublicKey: Uint8Array | null = null;
@@ -201,17 +231,15 @@ export class SSHSession {
   private hostKeyType: string = 'unknown';
 
   private versionRawBuffer: Uint8Array = new Uint8Array(0);
+  private versionPreambleBytes = 0;
   private negotiatedCipherC2S: string = 'aes128-gcm@openssh.com';
   private negotiatedCipherS2C: string = 'aes128-gcm@openssh.com';
   private negotiatedMacC2S: string = 'none';
   private negotiatedMacS2C: string = 'none';
 
   private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
-  private keepaliveFailCount: number = 0;
-  private readonly maxKeepaliveFails: number = 3;
-  private keepalivePending: boolean = false;
-  private keepaliveTimeout: ReturnType<typeof setTimeout> | null = null;
-  private keepaliveSentAt: number | null = null;
+  private keepaliveFailCount = 0;
+  private keepaliveProbe: KeepaliveProbe | null = null;
   private colo: string = 'UNKNOWN';
   private readonly onRttUpdated?: (latency: number, colo: string) => void;
   private lastPacketAt: number = Date.now();
@@ -235,12 +263,14 @@ export class SSHSession {
       resolve: (stream: DirectTcpipStream) => void;
       reject: (error: Error) => void;
       timeout: ReturnType<typeof setTimeout>;
+      subsystem?: boolean;
     }
   > = new Map();
   private channelWindowWaiters: Map<number, Array<() => void>> = new Map();
   private pendingAgentConfirmation: {
     id: string;
     command: string;
+    reason: string;
     resolve: (approved: boolean) => void;
     signal?: AbortSignal;
     onAbort: () => void;
@@ -294,10 +324,9 @@ export class SSHSession {
   }
 
   constructor(
-    ws: WebSocket,
+    ws: SSHSessionClient,
     socket: any,
     config: SSHConnectionConfig,
-    strictHostKeyVerify: boolean = true,
     debugMode: boolean = false,
     sftpAttachUrl?: string,
     env?: Env,
@@ -308,7 +337,6 @@ export class SSHSession {
     this.ws = ws;
     this.socket = socket;
     this.config = config;
-    this.strictHostKeyVerify = strictHostKeyVerify;
     this.debugMode = debugMode;
     this.sftpAttachUrl = sftpAttachUrl;
     this.env = env || null;
@@ -400,6 +428,16 @@ export class SSHSession {
       throw new Error('Invalid direct-tcpip destination');
     }
 
+    return this.openByteStream({ host, port });
+  }
+
+  /** A session/subsystem channel, without a PTY or the browser's SFTP state machine. */
+  async openSftpStream(): Promise<DirectTcpipStream> {
+    if (this.closed || this.state !== 'tunnel-ready') throw new Error('SSH session unavailable');
+    return this.openByteStream();
+  }
+
+  private async openByteStream(destination?: { host: string; port: number }): Promise<DirectTcpipStream> {
     const channelID = this.nextChannelID++;
     const channel = new SSHChannel(this.channelMaxPacketSize);
     this.channels.set(channelID, channel);
@@ -419,11 +457,13 @@ export class SSHSession {
         stream.remoteClose(new Error('direct-tcpip channel open timed out'));
         reject(new Error('跳板服务器建立目标转发通道超时'));
       }, 15_000);
-      this.pendingDirectTcpip.set(channelID, { resolve, reject, timeout });
+      this.pendingDirectTcpip.set(channelID, { resolve, reject, timeout, subsystem: !destination });
     });
 
     try {
-      await this.sendEncrypted(channel.buildOpenDirectTcpip(channelID, host, port));
+      await this.sendEncrypted(destination
+        ? channel.buildOpenDirectTcpip(channelID, destination.host, destination.port)
+        : channel.buildOpenSession(channelID));
     } catch (error) {
       const pending = this.pendingDirectTcpip.get(channelID);
       if (pending) clearTimeout(pending.timeout);
@@ -505,11 +545,15 @@ export class SSHSession {
               }
             }
 
-            if (lfIndex === -1) {
-              break;
+            const lineEnd = lfIndex === -1 ? this.versionRawBuffer.length : lfIndex + 1;
+            if (this.versionPreambleBytes + lineEnd - scanOffset > MAX_SSH_VERSION_PREAMBLE_BYTES) {
+              this.sendError('SSH 版本交换前导数据超过大小限制', 'packet_error');
+              this.close(true);
+              return;
             }
+            if (lfIndex === -1) break;
 
-            const lineBytes = this.versionRawBuffer.subarray(scanOffset, lfIndex + 1);
+            const lineBytes = this.versionRawBuffer.subarray(scanOffset, lineEnd);
             scanOffset = lfIndex + 1;
 
             let lineStr = this.textDecoder.decode(lineBytes);
@@ -517,16 +561,22 @@ export class SSHSession {
             if (lineStr.endsWith('\r')) lineStr = lineStr.slice(0, -1);
 
             if (lineStr.startsWith('SSH-')) {
+              if (lineBytes.length > MAX_SSH_IDENTIFICATION_BYTES) {
+                this.sendError('SSH 版本标识超过 255 字节', 'packet_error');
+                this.close(true);
+                return;
+              }
               this.transport.handleVersionExchange(`${lineStr}\r\n`);
               remaining = this.versionRawBuffer.subarray(scanOffset);
               versionFound = true;
               break;
-            } else {
             }
+            this.versionPreambleBytes += lineBytes.length;
           }
 
           if (versionFound) {
             this.versionRawBuffer = new Uint8Array(0);
+            this.versionPreambleBytes = 0;
             this.sendStatus('版本交换完成，正在密钥协商...', 'version_ready');
             this.state = 'kex';
             await this.startKEX();
@@ -729,30 +779,27 @@ export class SSHSession {
       this.close(true);
       return;
     }
-    if (
-      msgType === SSH_MSG_IGNORE ||
-      msgType === SSH_MSG_DEBUG ||
-      msgType === SSH_MSG_UNIMPLEMENTED
-    ) {
-      return;
-    }
+    if (msgType === SSH_MSG_IGNORE || msgType === SSH_MSG_DEBUG) return;
     if (msgType === SSH_MSG_GLOBAL_REQUEST) {
       await this.handleGlobalRequest(packet.payload);
       return;
     }
-    if (msgType === SSH_MSG_REQUEST_SUCCESS || msgType === SSH_MSG_REQUEST_FAILURE) {
-      // Response to our global request (e.g., keepalive)
-      if (this.keepalivePending && this.keepaliveSentAt !== null) {
-        const latency = Math.round(performance.now() - this.keepaliveSentAt);
-        this.keepaliveSentAt = null;
-        this.emitKeepaliveRtt(latency);
+    if (
+      msgType === SSH_MSG_REQUEST_SUCCESS ||
+      msgType === SSH_MSG_REQUEST_FAILURE ||
+      msgType === SSH_MSG_UNIMPLEMENTED
+    ) {
+      const probe = this.keepaliveProbe;
+      if (!probe || probe.sequence === null) return;
+      // Keepalive is our only outbound global request expecting a reply (81/82).
+      // RouterOS may reject the packet itself instead (RFC 4253 §11.4).
+      if (msgType === SSH_MSG_UNIMPLEMENTED) {
+        if (packet.payload.length !== 5 || readUint32(packet.payload, 1) !== probe.sequence) return;
+        this.sendDebug(() => `Keepalive UNIMPLEMENTED matched seq=${probe.sequence}`);
       }
-      this.keepalivePending = false;
+      this.clearKeepaliveProbe();
       this.keepaliveFailCount = 0;
-      if (this.keepaliveTimeout) {
-        clearTimeout(this.keepaliveTimeout);
-        this.keepaliveTimeout = null;
-      }
+      this.emitKeepaliveRtt(Math.round(performance.now() - probe.sentAt));
       return;
     }
 
@@ -830,59 +877,53 @@ export class SSHSession {
   }
 
   private startKeepalive(): void {
-    this.keepaliveFailCount = 0;
-    this.keepalivePending = false;
+    if (this.closed || this.keepaliveInterval !== null) return;
     this.startIdleWatchdog();
-    this.keepaliveInterval = setInterval(async () => {
-      if (this.keepalivePending) {
-        this.keepaliveFailCount++;
-        this.sendDebug(`Keepalive timeout (${this.keepaliveFailCount}/${this.maxKeepaliveFails})`);
-        if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
-          this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
-          this.close();
-          return;
+    this.keepaliveInterval = setInterval(() => void this.sendKeepalive(), KEEPALIVE_INTERVAL_MS);
+  }
+
+  private async sendKeepalive(): Promise<void> {
+    if (this.closed || this.keepaliveProbe) return;
+    const probe: KeepaliveProbe = { sequence: null, sentAt: 0 };
+    this.keepaliveProbe = probe;
+    try {
+      await this.sendEncryptedPacket(
+        () => this.buildEncryptedPacket(KEEPALIVE_REQUEST),
+        (sequence) => {
+          probe.sequence = sequence;
+          probe.sentAt = performance.now();
         }
-      }
+      );
+    } catch {
+      this.failKeepalive(probe, 'send failed');
+      return;
+    }
+    // A fast reply (or close) may already have consumed this probe during write().
+    if (this.keepaliveProbe === probe) {
+      probe.timeout = setTimeout(
+        () => this.failKeepalive(probe, 'response timeout'),
+        KEEPALIVE_REPLY_TIMEOUT_MS
+      );
+    }
+  }
 
-      try {
-        const payload = new Uint8Array(1 + 4 + KEEPALIVE_REQUEST_NAME.length + 1);
-        payload[0] = SSH_MSG_GLOBAL_REQUEST;
-        new DataView(payload.buffer).setUint32(1, KEEPALIVE_REQUEST_NAME.length, false);
-        payload.set(KEEPALIVE_REQUEST_NAME, 5);
-        payload[5 + KEEPALIVE_REQUEST_NAME.length] = 1; // want_reply = true
+  private clearKeepaliveProbe(): void {
+    const probe = this.keepaliveProbe;
+    if (probe?.timeout !== undefined) clearTimeout(probe.timeout);
+    this.keepaliveProbe = null;
+  }
 
-        this.keepaliveSentAt = performance.now();
-        await this.sendEncrypted(payload);
-        this.keepalivePending = true;
-
-        if (this.keepaliveTimeout) clearTimeout(this.keepaliveTimeout);
-        this.keepaliveTimeout = setTimeout(() => {
-          if (this.keepalivePending) {
-            this.keepaliveFailCount++;
-            this.sendDebug(
-              `Keepalive response timeout (${this.keepaliveFailCount}/${this.maxKeepaliveFails})`
-            );
-            this.keepalivePending = false;
-            this.keepaliveSentAt = null;
-            if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
-              this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
-              this.close();
-            }
-          }
-        }, 10000);
-      } catch (e) {
-        this.keepaliveFailCount++;
-        this.keepalivePending = false;
-        this.keepaliveSentAt = null;
-        this.sendDebug(
-          `Keepalive send failed (${this.keepaliveFailCount}/${this.maxKeepaliveFails}): ${e instanceof Error ? e.message : String(e)}`
-        );
-        if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
-          this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
-          this.close();
-        }
-      }
-    }, 25000);
+  private failKeepalive(probe: KeepaliveProbe, reason: 'response timeout' | 'send failed'): void {
+    if (this.keepaliveProbe !== probe) return;
+    this.clearKeepaliveProbe();
+    this.keepaliveFailCount++;
+    this.sendDebug(
+      () => `Keepalive ${reason} (${this.keepaliveFailCount}/${MAX_KEEPALIVE_FAILURES})`
+    );
+    if (this.keepaliveFailCount >= MAX_KEEPALIVE_FAILURES) {
+      this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
+      this.close();
+    }
   }
 
   /**
@@ -959,6 +1000,11 @@ export class SSHSession {
             filterExtInfo(serverKex.kexAlgorithms),
             'KEX algorithm'
           );
+          this.negotiatedHostKeyAlgorithm = negotiate(
+            clientKex.hostKeyAlgorithms,
+            serverKex.hostKeyAlgorithms,
+            'host key algorithm'
+          );
           this.negotiatedCipherC2S = negotiate(
             clientKex.encryptionC2S,
             serverKex.encryptionC2S,
@@ -984,13 +1030,13 @@ export class SSHSession {
                 'S2C MAC'
               );
           this.sendDebug(
-            `Negotiated KEX: ${this.negotiatedKexAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
+            `Negotiated KEX: ${this.negotiatedKexAlgorithm}, HostKey: ${this.negotiatedHostKeyAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
           );
           await this.sendKEXECDHInit();
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
           this.sendError(`算法协商失败: ${errMsg}`, 'algorithm_error', { message: errMsg });
-          this.close();
+          this.close(true);
         }
         break;
       }
@@ -1055,6 +1101,11 @@ export class SSHSession {
         filterExtInfo(serverKex.kexAlgorithms),
         'KEX algorithm'
       );
+      this.negotiatedHostKeyAlgorithm = negotiate(
+        clientKex.hostKeyAlgorithms,
+        serverKex.hostKeyAlgorithms,
+        'host key algorithm'
+      );
       this.negotiatedCipherC2S = negotiate(
         clientKex.encryptionC2S,
         serverKex.encryptionC2S,
@@ -1080,7 +1131,7 @@ export class SSHSession {
             'S2C MAC'
           );
       this.sendDebug(
-        `Rekey negotiated KEX: ${this.negotiatedKexAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
+        `Rekey negotiated KEX: ${this.negotiatedKexAlgorithm}, HostKey: ${this.negotiatedHostKeyAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
       );
 
       // 3. 生成并发送 ECDH Init（在当前活跃密钥下加密发送）
@@ -1088,7 +1139,8 @@ export class SSHSession {
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       this.sendDebug(`Rekey algorithm negotiation failed: ${errMsg}`);
-      this.finishRekey();
+      this.sendError(`算法协商失败: ${errMsg}`, 'algorithm_error', { message: errMsg });
+      this.close(true);
     }
   }
 
@@ -1173,6 +1225,19 @@ export class SSHSession {
       `ECDH_REPLY parsed: hostKey=${hostKey.length}, serverPubKey=${serverRawPublicKey.length}, sig=${signature.length}`
     );
 
+    let presentedKey: PresentedHostKey;
+    try {
+      if (!this.negotiatedHostKeyAlgorithm) throw new Error('Host key algorithm not negotiated');
+      assertHostKeyAlgorithm(this.negotiatedHostKeyAlgorithm, hostKey, signature);
+      presentedKey = await parsePresentedHostKey(hostKey);
+    } catch (error) {
+      this.sendDebug(`Host key rejected: ${error instanceof Error ? error.message : 'invalid key'}`);
+      this.sendError('主机密钥或证书无效，连接已终止', 'host_key_invalid');
+      this.close(true);
+      return;
+    }
+    if (this.closed) return;
+
     if (!this.negotiatedKexAlgorithm || !this.kexRawPublicKey) {
       throw new Error('KEX reply received before KEX init was sent');
     }
@@ -1225,61 +1290,31 @@ export class SSHSession {
       .join('');
     this.sendDebug(`Exchange hash H=${hHex}`);
 
-    // Extract host key algorithm type from the blob
+    if (this.closed) return;
+    // H above deliberately contains the ORIGINAL certificate, not the normalized raw key.
     try {
-      const ktLen = (hostKey[0] << 24) | (hostKey[1] << 16) | (hostKey[2] << 8) | hostKey[3];
-      this.hostKeyType = this.textDecoder.decode(hostKey.subarray(4, 4 + ktLen));
-    } catch {
-      this.hostKeyType = 'unknown';
-    }
-
-    // Compute host key fingerprint (SHA-256)
-    const fpHash = new Uint8Array(await crypto.subtle.digest('SHA-256', hostKey));
-    this.hostKeyFingerprint = `SHA256:${btoa(String.fromCharCode(...fpHash)).replace(/=+$/, '')}`;
-    this.sendDebug(`Host key fingerprint: ${this.hostKeyFingerprint} (${this.hostKeyType})`);
-
-    // Verify possession of the presented host key before comparing or persisting its fingerprint.
-    let sigVerified: boolean | null = false;
-    try {
-      sigVerified = await this.verifyHostKeySignature(hostKey, signature, H);
-      if (sigVerified === null) {
-        this.sendDebug('Host key signature verification: UNSUPPORTED ALGORITHM');
-        if (this.strictHostKeyVerify) {
-          this.sendError('主机密钥签名验证失败：不支持的密钥算法', 'host_key_unsupported');
-          this.close();
-          return;
-        }
-        this.sendStatus('主机密钥签名验证被跳过（暂不支持该算法）', 'host_key_verify_skipped');
-      } else {
-        this.sendDebug(`Host key signature verification: ${sigVerified ? 'PASS' : 'FAIL'}`);
-        if (!sigVerified) {
-          if (this.strictHostKeyVerify) {
-            this.sendError(
-              '主机密钥签名验证失败，连接被阻断。如需跳过，请设置 STRICT_HOST_KEY_VERIFY=false',
-              'host_key_signature_blocked'
-            );
-            this.close();
-            return;
-          }
-          this.sendError(
-            '主机密钥签名验证失败 - 可能会有安全风险，但不阻断连接（严格模式已关闭）',
-            'host_key_signature_risk'
-          );
-        }
-      }
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      this.sendDebug(`Signature verification error: ${errMsg}`);
-      if (this.strictHostKeyVerify) {
-        this.sendError(`主机密钥签名验证异常: ${errMsg}`, 'host_key_signature_error', {
-          message: errMsg,
-        });
-        this.close();
+      const verified = await verifySSHSignature(presentedKey.publicKeyBlob, signature, H);
+      if (this.closed) return;
+      if (!verified) {
+        this.sendError('主机密钥签名验证失败，连接已终止', 'host_key_invalid');
+        this.close(true);
         return;
       }
+    } catch (error) {
+      if (this.closed) return;
+      this.sendDebug(`Signature verification error: ${error instanceof Error ? error.message : 'invalid signature'}`);
+      this.sendError('主机密钥或证书无效，连接已终止', 'host_key_invalid');
+      this.close(true);
+      return;
     }
-
-    if (!this.finalizeHostKeyTrust(sigVerified === true)) return;
+    this.hostKeyType = presentedKey.keyType;
+    this.hostKeyFingerprint = await fingerprintHostKey(presentedKey.publicKeyBlob);
+    if (this.closed || !this.finalizeHostKeyTrust()) return;
+    this.acceptedHostKeyFingerprint ??= this.hostKeyFingerprint;
+    this.sendDebug(`Host key fingerprint: ${this.hostKeyFingerprint} (${this.hostKeyType})`);
+    if (presentedKey.certificate && !this.isRekeying) {
+      this.sendStatus('主机证书使用公钥指纹 TOFU 验证，未信任签发 CA', 'host_key_certificate_tofu');
+    }
 
     if (!this.sessionID) {
       this.sessionID = H;
@@ -1291,7 +1326,7 @@ export class SSHSession {
     const macC2S = getMacSpec(this.negotiatedMacC2S);
     const macS2C = getMacSpec(this.negotiatedMacS2C);
 
-    this.derivedKeys = await KeyDerivation.deriveKeys(
+    const derivedKeys = await KeyDerivation.deriveKeys(
       sharedSecret,
       H,
       this.sessionID!,
@@ -1300,14 +1335,22 @@ export class SSHSession {
       macC2S.keyLength,
       macS2C.keyLength
     );
+    if (this.closed) return;
+    this.derivedKeys = derivedKeys;
     this.sendDebug('Keys derived, waiting for NEWKEYS');
   }
 
   /**
    * 完成 TOFU 判定。只有服务器已证明持有当前主机私钥时，才允许浏览器记录或替换指纹。
    */
-  private finalizeHostKeyTrust(signatureVerified: boolean): boolean {
+  private finalizeHostKeyTrust(): boolean {
     if (this.isRekeying) {
+      // Renewal may change certificate metadata, but never silently replace the pinned host key.
+      if (this.acceptedHostKeyFingerprint !== this.hostKeyFingerprint) {
+        this.sendError('主机密钥指纹变更，重协商已终止', 'host_key_changed');
+        this.close(true);
+        return false;
+      }
       return true;
     }
     const expectedFingerprint = this.config.expectedFingerprint;
@@ -1322,7 +1365,7 @@ export class SSHSession {
 
     if (expectedFingerprint && expectedFingerprint !== this.hostKeyFingerprint) {
       const mayReplaceHostKey = this.config.sessionPolicy?.allowHostKeyMutation !== false;
-      if (signatureVerified && mayReplaceHostKey) {
+      if (mayReplaceHostKey) {
         try {
           this.ws.send(
             JSON.stringify({
@@ -1347,42 +1390,17 @@ export class SSHSession {
           keyType: this.hostKeyType,
         }
       );
-      let trustInstruction: string;
-      let trustEvent: string;
-      if (signatureVerified && mayReplaceHostKey) {
-        trustInstruction = '连接已阻断。请在确认对话框中核对并决定是否信任新指纹。';
-        trustEvent = 'host_key_trust_instruction';
-      } else if (signatureVerified) {
-        trustInstruction = '连接已阻断。分享会话不允许替换所有者已信任的主机指纹。';
-        trustEvent = 'host_key_share_change_blocked';
+      if (mayReplaceHostKey) {
+        this.sendError('连接已阻断。请在确认对话框中核对并决定是否信任新指纹。', 'host_key_trust_instruction');
       } else {
-        trustInstruction = '连接已阻断，且主机密钥签名未通过验证，无法信任新指纹。';
-        trustEvent = 'host_key_unverified_instruction';
+        this.sendError('连接已阻断。分享会话不允许替换所有者已信任的主机指纹。', 'host_key_share_change_blocked');
       }
-      this.sendError(trustInstruction, trustEvent);
       this.close(true);
       return false;
     }
 
     if (expectedFingerprint) {
-      if (signatureVerified) {
-        this.sendStatus(`主机密钥验证通过 (${this.hostKeyType}) ✓`, 'host_key_accepted');
-      } else {
-        this.sendStatus(
-          `已知主机指纹匹配 (${this.hostKeyType})，但签名未验证`,
-          'host_key_fingerprint_matched_unverified',
-          { keyType: this.hostKeyType }
-        );
-      }
-      return true;
-    }
-
-    if (!signatureVerified) {
-      this.sendStatus(
-        `服务器指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})（签名未验证，未记录）`,
-        'host_key_not_saved',
-        { fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType }
-      );
+      this.sendStatus(`主机密钥验证通过 (${this.hostKeyType}) ✓`, 'host_key_accepted');
       return true;
     }
 
@@ -1403,178 +1421,6 @@ export class SSHSession {
       { fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType }
     );
     return true;
-  }
-
-  private async verifyHostKeySignature(
-    hostKeyBlob: Uint8Array,
-    signatureBlob: Uint8Array,
-    exchangeHash: Uint8Array
-  ): Promise<boolean | null> {
-    // Parse host key blob to get key type and raw key
-    let offset = 0;
-    const keyTypeLen =
-      (hostKeyBlob[offset] << 24) |
-      (hostKeyBlob[offset + 1] << 16) |
-      (hostKeyBlob[offset + 2] << 8) |
-      hostKeyBlob[offset + 3];
-    offset += 4;
-    const keyType = this.textDecoder.decode(hostKeyBlob.subarray(offset, offset + keyTypeLen));
-    offset += keyTypeLen;
-    this.sendDebug(`Host key type: ${keyType}`);
-
-    // Parse signature blob to get sig type and raw sig
-    let sigOffset = 0;
-    const sigTypeLen =
-      (signatureBlob[sigOffset] << 24) |
-      (signatureBlob[sigOffset + 1] << 16) |
-      (signatureBlob[sigOffset + 2] << 8) |
-      signatureBlob[sigOffset + 3];
-    sigOffset += 4;
-    const sigType = this.textDecoder.decode(
-      signatureBlob.subarray(sigOffset, sigOffset + sigTypeLen)
-    );
-    sigOffset += sigTypeLen;
-    const rawSigLen =
-      (signatureBlob[sigOffset] << 24) |
-      (signatureBlob[sigOffset + 1] << 16) |
-      (signatureBlob[sigOffset + 2] << 8) |
-      signatureBlob[sigOffset + 3];
-    sigOffset += 4;
-    const rawSig = signatureBlob.subarray(sigOffset, sigOffset + rawSigLen);
-    this.sendDebug(`Signature type: ${sigType}, raw sig len: ${rawSig.length}`);
-
-    if (keyType === 'ssh-ed25519') {
-      const rawKeyLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4;
-      const rawKey = hostKeyBlob.subarray(offset, offset + rawKeyLen);
-      this.sendDebug(`Ed25519 public key: ${rawKey.length} bytes`);
-
-      const pubKey = await crypto.subtle.importKey('raw', rawKey, { name: 'Ed25519' }, false, [
-        'verify',
-      ]);
-
-      return await crypto.subtle.verify('Ed25519', pubKey, rawSig, exchangeHash);
-    } else if (
-      keyType === 'ecdsa-sha2-nistp256' ||
-      keyType === 'ecdsa-sha2-nistp384' ||
-      keyType === 'ecdsa-sha2-nistp521'
-    ) {
-      // RFC 5656: ECDSA 主机密钥按曲线 exhaustive 支持
-      let namedCurve: string;
-      let hash: 'SHA-256' | 'SHA-384' | 'SHA-512';
-      let coordBytes: number;
-      switch (keyType) {
-        case 'ecdsa-sha2-nistp256':
-          namedCurve = 'P-256';
-          hash = 'SHA-256';
-          coordBytes = 32;
-          break;
-        case 'ecdsa-sha2-nistp384':
-          namedCurve = 'P-384';
-          hash = 'SHA-384';
-          coordBytes = 48;
-          break;
-        case 'ecdsa-sha2-nistp521':
-          namedCurve = 'P-521';
-          hash = 'SHA-512';
-          coordBytes = 66;
-          break;
-        default:
-          throw new Error(`unsupported ECDSA host key: ${keyType}`);
-      }
-
-      // Parse ECDSA key blob: string(curve), string(point)
-      const curveLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4 + curveLen;
-      const rawKeyLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4;
-      const rawKey = hostKeyBlob.subarray(offset, offset + rawKeyLen);
-      this.sendDebug(`ECDSA public key: ${rawKey.length} bytes, curve=${namedCurve}`);
-
-      const pubKey = await crypto.subtle.importKey(
-        'raw',
-        rawKey,
-        { name: 'ECDSA', namedCurve },
-        false,
-        ['verify']
-      );
-
-      // Convert SSH (r||s) signature to raw r||s for Web Crypto（按曲线坐标长度 pad）
-      const ecdsaRawSig = convertSSHECDSASig(rawSig, coordBytes);
-      this.sendDebug(`ECDSA raw sig: ${ecdsaRawSig.length} bytes`);
-
-      return await crypto.subtle.verify({ name: 'ECDSA', hash }, pubKey, ecdsaRawSig, exchangeHash);
-    } else if (keyType === 'ssh-rsa') {
-      // Parse RSA key
-      const eLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4;
-      const eRaw = hostKeyBlob.subarray(offset, offset + eLen);
-      offset += eLen;
-
-      const nLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4;
-      const nRaw = hostKeyBlob.subarray(offset, offset + nLen);
-
-      // Determine hash algorithm based on signature type (RFC 8332)
-      let hashAlgo: 'SHA-256' | 'SHA-512' | 'SHA-1';
-      if (sigType === 'rsa-sha2-256') hashAlgo = 'SHA-256';
-      else if (sigType === 'rsa-sha2-512') hashAlgo = 'SHA-512';
-      else if (sigType === 'ssh-rsa') hashAlgo = 'SHA-1';
-      else {
-        this.sendDebug(`Unknown RSA signature type: ${sigType}`);
-        return false;
-      }
-
-      this.sendDebug(
-        `RSA public key: n=${nRaw.length} bytes, e=${eRaw.length} bytes, sigType=${sigType}, hash=${hashAlgo}`
-      );
-
-      // Convert to JWK format for import
-      const jwk = {
-        kty: 'RSA',
-        e: base64UrlEncodeUnsigned(eRaw),
-        n: base64UrlEncodeUnsigned(nRaw),
-        ext: true,
-      };
-
-      try {
-        const pubKey = await crypto.subtle.importKey(
-          'jwk',
-          jwk,
-          { name: 'RSASSA-PKCS1-v1_5', hash: hashAlgo },
-          false,
-          ['verify']
-        );
-
-        return await crypto.subtle.verify('RSASSA-PKCS1-v1_5', pubKey, rawSig, exchangeHash);
-      } catch (e) {
-        this.sendDebug(`RSA import/verify error: ${e}`);
-        return false;
-      }
-    }
-
-    this.sendDebug(`Unsupported key type for verification: ${keyType}`);
-    return null; // Return null for unsupported algorithms instead of failing
   }
 
   private async enableEncryption(): Promise<void> {
@@ -1649,7 +1495,13 @@ export class SSHSession {
           Boolean(this.config.privateKey && this.sessionID)
         );
       case 'password':
-        return this.config.authMethod !== 'publickey' && typeof this.config.password === 'string';
+        if (this.config.authMethod === 'publickey') {
+          // Only an advertised additional factor may prompt after partial success.
+          // Intermediate hops and shared sessions cannot surface authentication prompts.
+          return this.partialAuthenticationStages > 0 && this.allowKeyboardInteractive &&
+            this.config.sessionPolicy?.source !== 'share';
+        }
+        return typeof this.config.password === 'string';
       case 'keyboard-interactive':
         // 分享会话不能把所有者保存的密码交由接收者决定如何响应远端挑战。
         return this.allowKeyboardInteractive && this.config.sessionPolicy?.source !== 'share';
@@ -1673,10 +1525,17 @@ export class SSHSession {
           this.config.privateKey!,
           this.sessionID!,
           this.serverSigAlgs,
-          false
+          false,
+          this.config.certificate
         );
         break;
       case 'password':
+        if (this.config.authMethod === 'publickey') {
+          this.activeAuthMethod = method;
+          this.attemptedAuthMethods.add(method);
+          this.interactiveAuth.requestPasswordFactor();
+          return true;
+        }
         authRequest = SSHAuth.buildPasswordAuthRequest(this.config.username, this.config.password);
         break;
       case 'keyboard-interactive':
@@ -1698,7 +1557,7 @@ export class SSHSession {
   ): ActiveAuthMethod | null {
     const configuredFirst: ActiveAuthMethod[] =
       this.config.authMethod === 'publickey'
-        ? ['publickey', 'keyboard-interactive']
+        ? ['publickey', 'password', 'keyboard-interactive']
         : ['password', 'keyboard-interactive'];
     // RFC 4252 allows a server to omit the list in a failure response. Keep
     // compatibility with such servers after the harmless "none" probe by
@@ -1840,14 +1699,14 @@ export class SSHSession {
           // be attempted again (for example keyboard-interactive,publickey).
           this.attemptedAuthMethods.clear();
         } else if (
-          previousMethod === configuredPrimaryMethod &&
-          allowedMethods.includes(configuredPrimaryMethod)
+          (previousMethod === configuredPrimaryMethod || previousMethod === 'password') &&
+          allowedMethods.includes(previousMethod)
         ) {
           // The configured credential was rejected and the server still
           // offers the same method. Do not reinterpret that rejection as an
           // interactive challenge merely because keyboard-interactive is
           // also advertised.
-          this.sendDebug(`Configured authentication method rejected: ${configuredPrimaryMethod}`);
+          this.sendDebug(`Credential authentication method rejected: ${previousMethod}`);
           this.failAuthentication(undefined, 'auth_failed', true);
           break;
         }
@@ -1857,6 +1716,12 @@ export class SSHSession {
           break;
         }
 
+        if (!this.allowKeyboardInteractive &&
+          (allowedMethods.includes('keyboard-interactive') ||
+            (partialSuccess && this.config.authMethod === 'publickey' && allowedMethods.includes('password')))) {
+          this.failAuthentication(undefined, 'auth_interactive_required', true);
+          break;
+        }
         // A server-side credential rejection is an expected authentication
         // outcome, not an internal WebSocket failure.
         this.failAuthentication(undefined, undefined, true);
@@ -1916,7 +1781,9 @@ export class SSHSession {
         );
 
         const directPending = this.pendingDirectTcpip.get(channelID);
-        if (directPending) {
+        if (directPending?.subsystem) {
+          await this.sendEncrypted(channel.buildSubsystemRequest('sftp'));
+        } else if (directPending) {
           clearTimeout(directPending.timeout);
           this.pendingDirectTcpip.delete(channelID);
           const stream = this.directTcpipStreams.get(channelID);
@@ -1976,15 +1843,9 @@ export class SSHSession {
           this.sendSFTPError('init', `服务器不支持 SFTP: ${description}`);
           this.sftpHandler = null;
         } else if (this.isExecChannel(channelID)) {
-          // Exec channel open failed - reject just this command, keep SSH session alive
-          const execCh = this.activeExecChannels.get(channelID);
-          if (execCh) {
-            execCh.onChannelOpenFailure(reasonCode, description);
-            this.activeExecChannels.delete(channelID);
-          }
-          this.sendDebug(
-            `Exec channel open failed: channelID=${channelID}, reason=${reasonCode}, desc=${description}`
-          );
+          // Exec channel open failed - reject just this command, keep SSH session alive.
+          this.activeExecChannels.get(channelID)?.onChannelOpenFailure();
+          this.sendDebug(`Exec channel open failed: channelID=${channelID}, reason=${reasonCode}`);
         } else {
           // Shell channel failed - close connection
           this.sendError('通道打开被拒绝', 'channel_rejected');
@@ -1995,6 +1856,15 @@ export class SSHSession {
 
       case SSH_MSG_CHANNEL_SUCCESS: {
         const channelID = this.getChannelIDFromPayload(payload);
+        const pending = this.pendingDirectTcpip.get(channelID);
+        if (pending?.subsystem) {
+          clearTimeout(pending.timeout);
+          this.pendingDirectTcpip.delete(channelID);
+          const stream = this.directTcpipStreams.get(channelID);
+          if (stream) pending.resolve(stream);
+          else pending.reject(new Error('SFTP channel unavailable'));
+          break;
+        }
         if (channelID === this.shellChannel.getLocalChannelID() && this.state === 'shell') {
           // PTY request confirmed, send shell request
           const shellReq = this.shellChannel.buildShellRequest();
@@ -2029,23 +1899,31 @@ export class SSHSession {
             }
           });
         } else {
-          // Exec channel success — could be exec request confirmed or exit-status
-          // Try to parse exit-status from payload
-          const execCh = this.activeExecChannels.get(channelID);
-          if (execCh) {
-            this.sendDebug(`Exec channel success: channelID=${channelID}`);
-          }
+          this.activeExecChannels.get(channelID)?.onRequestSuccess();
         }
         break;
       }
 
       case SSH_MSG_CHANNEL_FAILURE: {
         const channelID = this.getChannelIDFromPayload(payload);
+        const pending = this.pendingDirectTcpip.get(channelID);
+        if (pending?.subsystem) {
+          clearTimeout(pending.timeout);
+          this.pendingDirectTcpip.delete(channelID);
+          pending.reject(new Error('SFTP subsystem rejected'));
+          this.directTcpipStreams.get(channelID)?.remoteClose(new Error('SFTP subsystem rejected'));
+          break;
+        }
         if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
           this.sendSFTPError('init', 'SFTP subsystem 请求被拒绝');
           this.sftpHandler.dispose();
           this.sftpHandler = null;
-        } else if (this.state === 'shell' || this.state === 'shell-requested') {
+        } else if (this.activeExecChannels.has(channelID)) {
+          this.activeExecChannels.get(channelID)?.onRequestFailure();
+        } else if (
+          channelID === this.shellChannel.getLocalChannelID() &&
+          (this.state === 'shell' || this.state === 'shell-requested')
+        ) {
           this.sendError('PTY 或 Shell 请求被拒绝', 'pty_shell_rejected');
           this.close();
         }
@@ -2263,12 +2141,8 @@ export class SSHSession {
 
         if (reqType === 'exit-status') {
           const execCh = this.activeExecChannels.get(reqChannelID);
-          if (execCh) {
-            const exitCode =
-              (payload[offset] << 24) |
-              (payload[offset + 1] << 16) |
-              (payload[offset + 2] << 8) |
-              payload[offset + 3];
+          if (execCh && payload.length - offset >= 4) {
+            const exitCode = readUint32(payload, offset);
             execCh.onExitStatus(exitCode);
             this.sendDebug(
               `Exec channel exit-status: channelID=${reqChannelID}, exitCode=${exitCode}`
@@ -2338,6 +2212,11 @@ export class SSHSession {
         if (parsed.type === 'resize') {
           this.recordUserActivity();
           await this.handleResize(parsed.cols, parsed.rows);
+          return;
+        }
+
+        if (parsed.type === 'agent_sync') {
+          this.sendAgentState(parsed.syncId);
           return;
         }
 
@@ -2429,13 +2308,20 @@ export class SSHSession {
   }
 
   private async handleSFTPMessage(msg: any): Promise<void> {
+    const requestId =
+      msg.type === 'sftp_stat' &&
+      typeof msg.requestId === 'string' &&
+      msg.requestId.length > 0 &&
+      msg.requestId.length <= 64
+        ? msg.requestId
+        : undefined;
     if (this.state !== 'ready') {
-      this.sendSFTPError(this.getSFTPOperation(msg.type), 'SSH 连接未就绪');
+      this.sendSFTPError(this.getSFTPOperation(msg.type), 'SSH 连接未就绪', requestId);
       return;
     }
 
     if (this.config.sessionPolicy?.source === 'share' && !this.config.sessionPolicy.allowSftp) {
-      this.sendSFTPError(this.getSFTPOperation(msg.type), '当前分享会话不允许使用 SFTP');
+      this.sendSFTPError(this.getSFTPOperation(msg.type), '当前分享会话不允许使用 SFTP', requestId);
       return;
     }
 
@@ -2445,7 +2331,7 @@ export class SSHSession {
     }
 
     if (!this.sftpHandler) {
-      this.sendSFTPError(this.getSFTPOperation(msg.type), 'SFTP 未初始化，请先发送 sftp_init');
+      this.sendSFTPError(this.getSFTPOperation(msg.type), 'SFTP 未初始化，请先发送 sftp_init', requestId);
       return;
     }
 
@@ -2456,7 +2342,7 @@ export class SSHSession {
         await this.sftpHandler.listDirectory(msg.path || '.');
         break;
       case 'sftp_stat':
-        await this.sftpHandler.stat(msg.path);
+        await this.sftpHandler.stat(msg.path, requestId);
         break;
       case 'sftp_download':
         await this.sftpHandler.downloadFile(msg.path);
@@ -2667,8 +2553,13 @@ export class SSHSession {
     );
   }
 
-  private sendSFTPError(operation: string, message: string): void {
-    this.sendSFTPJSON({ type: 'sftp_error', operation, message });
+  private sendSFTPError(operation: string, message: string, requestId?: string): void {
+    this.sendSFTPJSON({
+      type: 'sftp_error',
+      operation,
+      message,
+      ...(requestId ? { requestId } : {}),
+    });
   }
 
   private sendSFTPJSON(msg: any): void {
@@ -2842,25 +2733,26 @@ export class SSHSession {
     await this.sendEncryptedPacket(() => this.buildEncryptedChannelDataPacket(chunk, channel));
   }
 
-  private async sendEncryptedPacket(buildPacket: () => Promise<Uint8Array>): Promise<void> {
+  private async sendEncryptedPacket(
+    buildPacket: () => Promise<Uint8Array>,
+    beforeWrite?: (sequence: number) => void
+  ): Promise<void> {
     this.sendMutexPendingCount++;
     const operation = this.sendMutex.then(async () => {
+      if (this.closed) throw new Error('SSH session closed');
+      // Capture the builder's actual uint32 sequence under the shared send lock,
+      // not at enqueue time or after write() (other packets / fast replies).
+      const sequence = this.seqNumSend;
       const encrypted = await buildPacket();
+      if (this.closed) throw new Error('SSH session closed');
+      beforeWrite?.(sequence);
       await this.writeSocket(encrypted);
     });
 
-    this.sendMutex = operation.then(
-      () => {
-        if (--this.sendMutexPendingCount === 0) {
-          this.sendMutex = Promise.resolve();
-        }
-      },
-      () => {
-        if (--this.sendMutexPendingCount === 0) {
-          this.sendMutex = Promise.resolve();
-        }
-      }
-    );
+    const release = () => {
+      if (--this.sendMutexPendingCount === 0) this.sendMutex = Promise.resolve();
+    };
+    this.sendMutex = operation.then(release, release);
     await operation;
   }
 
@@ -3024,6 +2916,7 @@ export class SSHSession {
         serverId: this.config.serverId,
         userId: this.userId,
         githubId: this.githubId,
+        userDbRouteKey: this.config.userDbRouteKey,
         env: this.env,
         executeCommand: (cmd, timeout) => this.executeAgentCommand(cmd, timeout),
         onOSDetected: (detected) => {
@@ -3105,6 +2998,7 @@ export class SSHSession {
         this.sendAgentFrame({
           type: 'agent_frame',
           subType: 'error',
+          code: 'agent_busy',
           message: 'Agent 正在运行中，请先停止当前任务',
         });
         return;
@@ -3118,90 +3012,19 @@ export class SSHSession {
       const gid = this.githubId;
       const env = this.env;
       if (serverId && uid && gid && env) {
-        memoryProvider = {
-          fetchUnifiedMemory: async () => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              const res = await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/memory?user_id=${uid}`)
-              );
-              if (!res.ok) return { workLogs: [], knowledge: [] };
-              return (await res.json()) as UnifiedServerMemory;
-            } catch {
-              return { workLogs: [], knowledge: [] };
-            }
-          },
-          saveBatchMemory: async (batch) => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/memory/batch`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ user_id: Number(uid), ...batch }),
-                })
-              );
-            } catch {
-              /* ignore */
-            }
-          },
-          beginSession: async (context) => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/agent-session`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ user_id: Number(uid), ...context }),
-                })
-              );
-            } catch {
-              /* ignore */
-            }
-          },
-          saveTaskCheckpoint: async (checkpoint, context) => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/agent-checkpoint`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ user_id: Number(uid), checkpoint, ...context }),
-                })
-              );
-            } catch {
-              /* ignore */
-            }
-          },
-          fetchTaskCheckpoint: async (taskId) => {
-            const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-            const res = await stub.fetch(
-              new Request(`http://internal/internal/servers/${serverId}/agent-checkpoint?user_id=${uid}&task_id=${taskId}`)
-            );
-            if (!res.ok) throw new Error('Checkpoint not found');
-            return (await res.json()) as AgentTaskCheckpoint;
-          },
-          deleteTaskCheckpoint: async (taskId, context) => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/agent-checkpoint`, {
-                  method: 'DELETE',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ user_id: Number(uid), taskId, ...context }),
-                })
-              );
-            } catch {
-              /* ignore */
-            }
-          },
-        };
+        memoryProvider = createAgentMemoryProvider(
+          env,
+          this.config.userDbRouteKey || gid,
+          uid,
+          serverId
+        );
       }
 
       this.agentCore = new AgentCore(
         this.terminalContext,
         (msg: any) => this.sendAgentFrame(msg),
-        async (uId: string) => this.fetchAgentAIConfig(uId, this.githubId!),
+        async (uId: string) =>
+          this.fetchAgentAIConfig(uId, this.config.userDbRouteKey || this.githubId!),
         async (command: string, timeout: number, signal?: AbortSignal) =>
           this.executeAgentCommand(command, timeout, signal),
         async (command: string, reason: string, signal?: AbortSignal) =>
@@ -3221,6 +3044,20 @@ export class SSHSession {
         ? requestedTimezone
         : undefined;
     void this.agentCore.handleAgentStart(effectiveUserId, userMessage, locale, timezone, userIndex, requestId);
+  }
+
+  private sendAgentState(syncId: unknown): void {
+    if (this.closed || this.isDetached() || !this.userId || this.config.sessionPolicy?.source === 'share' ||
+      (this.state !== 'ready' && this.state !== 'rekey') ||
+      typeof syncId !== 'string' || !syncId || syncId.length > 64) return;
+    const state = this.agentCore?.getSessionState() ?? emptyAgentSessionState();
+    const pending = this.pendingAgentConfirmation;
+    if (pending) {
+      state.phase = 'waiting_confirmation';
+      state.confirmation = { confirmationId: pending.id, command: pending.command, reason: pending.reason };
+    }
+    // Read-only synchronization is neither user activity nor task execution.
+    this.sendAgentFrame({ type: 'agent_frame', subType: 'state', syncId, state });
   }
 
   /**
@@ -3294,115 +3131,75 @@ export class SSHSession {
     }
   }
 
-  private async executeAgentCommand(
-    command: string,
-    timeout: number,
-    signal?: AbortSignal
-  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  private executeAgentCommand(command: string, timeout: number, signal?: AbortSignal) {
+    return this.executeCommand(command, timeout, signal);
+  }
+
+  /** Shared, bounded non-PTY exec. Approval belongs to the calling interface. */
+  async executeCommand(command: string, timeout: number, signal?: AbortSignal): Promise<import('./agent/types').ExecResult> {
+    if (!this.isOperational()) {
+      throw new SshExecError(this.closed ? 'exec_transport_closed' : 'exec_failed', 'not_executed');
+    }
+    if (signal?.aborted) throw new SshExecError('exec_cancelled', 'not_executed');
     this.recordUserActivity();
     const channelID = this.nextChannelID++;
     const channel = new SSHChannel(this.channelMaxPacketSize);
+    const execCh = new AgentExecChannel();
     this.channels.set(channelID, channel);
-
-    const execCh = new AgentExecChannel(channelID, channel);
     this.activeExecChannels.set(channelID, execCh);
-
-    // Open channel
-    const openMsg = channel.buildOpenSession(channelID);
-    await this.sendEncrypted(openMsg);
-
-    try {
-      // Wait for channel open confirmation (via execCh state flags, not this.channels map)
-      const opened = await this.waitForExecChannelOpen(execCh, channel, command);
-
-      if (!opened) {
-        // Open rejected — closedPromise already resolved with error struct; await it
-        return await execCh.getClosedPromise();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let openTimer: ReturnType<typeof setTimeout> | undefined;
+    let rejectStop!: (error: SshExecError) => void;
+    let stopped: SshExecError | undefined;
+    let requestStarted = false;
+    const outcome = () => requestStarted ? 'unknown' : 'not_executed';
+    const stop = (error: SshExecError) => {
+      if (stopped) return;
+      stopped = error;
+      rejectStop(error);
+    };
+    const onAbort = () => stop(new SshExecError('exec_cancelled', outcome()));
+    const cancelled = new Promise<never>((_, reject) => { rejectStop = reject; });
+    timer = setTimeout(() => stop(new SshExecError(
+      requestStarted ? 'exec_timeout' : 'exec_channel_timeout', outcome()
+    )), timeout);
+    openTimer = setTimeout(() => stop(new SshExecError('exec_channel_timeout', 'not_executed')), 5000);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const work = (async () => {
+      await this.sendEncrypted(channel.buildOpenSession(channelID));
+      const opened = await execCh.getOpenedPromise();
+      clearTimeout(openTimer);
+      if (stopped) throw stopped;
+      if (execCh.isOpenFailed()) throw new SshExecError('exec_channel_rejected', 'not_executed');
+      if (this.closed) throw new SshExecError('exec_transport_closed', 'not_executed');
+      if (!opened || !execCh.startExecRequest()) {
+        throw new SshExecError('exec_channel_closed', 'not_executed');
       }
-
-      // Open succeeded — send exec request
-      const execReq = channel.buildExecRequest(command);
-      await this.sendEncrypted(execReq);
-
-      // Wait for result with timeout + abort
-      let aborted = false;
-      const result = await Promise.race([
-        execCh.getClosedPromise(),
-        new Promise<{ stdout: string; stderr: string; exitCode: number }>((_, reject) => {
-          const timer = setTimeout(
-            () => reject(new Error(`Exec timeout after ${timeout}ms`)),
-            timeout
-          );
-          signal?.addEventListener(
-            'abort',
-            () => {
-              aborted = true;
-              clearTimeout(timer);
-              reject(new Error('Exec aborted'));
-            },
-            { once: true }
-          );
-        }),
-      ]);
-
-      // Cleanup: send EOF + CLOSE to server (RFC 4254 §5.3)
-      // Always attempt cleanup, even on abort, to prevent resource leaks
-      if (!channel.isClosed()) {
-        try {
-          await this.sendEncrypted(channel.buildEof());
-          await this.sendEncrypted(channel.buildClose());
-        } catch {
-          // Channel may already be closed by server, ignore
-        }
-      }
-
-      // If aborted, also close the exec channel to resolve any pending promises
-      if (aborted) {
-        execCh.onClose();
-      }
-
+      // Once a write is attempted, neither a write error nor cancellation proves non-execution.
+      requestStarted = true;
+      await this.sendEncrypted(channel.buildExecRequest(command));
+      const result = await execCh.getClosedPromise();
+      if (execCh.wasRequestRejected()) throw new SshExecError('exec_rejected', 'not_executed');
+      if (this.closed && result.exitCode < 0) throw new SshExecError('exec_transport_closed', 'unknown');
       return result;
+    })();
+    try {
+      return await Promise.race([work, cancelled]);
+    } catch (error) {
+      if (error instanceof SshExecError) throw error;
+      throw new SshExecError(this.closed ? 'exec_transport_closed' : 'exec_failed', outcome());
     } finally {
-      // 无论成功、失败、超时或被中止，都必须清理 channel 引用，防止资源泄漏
-      // （之前 waitForExecChannelOpen 超时 throw 会跳过清理，导致 execCh 残留在 activeExecChannels）
+      clearTimeout(timer);
+      clearTimeout(openTimer);
+      signal?.removeEventListener('abort', onAbort);
       this.activeExecChannels.delete(channelID);
       this.channels.delete(channelID);
+      execCh.onClose();
+      // Best effort: closing a channel does NOT prove all remote subprocesses stopped.
+      if (!this.closed && execCh.isOpenConfirmed() && !channel.isClosed()) {
+        try { await this.sendEncrypted(channel.buildClose()); } catch { /* transport closing */ }
+      }
     }
-  }
-
-  private waitForExecChannelOpen(
-    execCh: AgentExecChannel,
-    channel: SSHChannel,
-    command: string
-  ): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      const start = Date.now();
-      const timeout = 5000;
-
-      const check = () => {
-        // Open rejected by server — return false, caller will await closedPromise
-        if (execCh.isOpenFailed()) {
-          resolve(false);
-          return;
-        }
-
-        // Open succeeded — return true, caller will send exec request
-        if (execCh.isOpenConfirmed() || channel.getRemoteChannelID() !== 0) {
-          resolve(true);
-          return;
-        }
-
-        // Timeout — reject with error
-        if (Date.now() - start > timeout) {
-          reject(new Error(`Exec channel open timeout (5s) for command: ${command}`));
-          return;
-        }
-
-        setTimeout(check, 50);
-      };
-
-      check();
-    });
   }
 
   /** Waiting is not active execution: user inactivity continues to expire it. */
@@ -3417,7 +3214,7 @@ export class SSHSession {
       const onAbort = () => {
         if (this.pendingAgentConfirmation?.id === id) this.finishAgentConfirmation(false);
       };
-      this.pendingAgentConfirmation = { id, command, resolve, signal, onAbort };
+      this.pendingAgentConfirmation = { id, command, reason, resolve, signal, onAbort };
       signal?.addEventListener('abort', onAbort, { once: true });
       this.sendAgentFrame({
         type: 'agent_frame', subType: 'confirm_required', confirmationId: id, command, reason,
@@ -3462,7 +3259,14 @@ export class SSHSession {
   private sendAgentFrame(msg: any): void {
     try {
       if (this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify(msg));
+        let frame = msg;
+        if (msg.diagnostics) {
+          this.sendDebug(() => responseErrorDebugMessage(msg.errorCode ?? msg.code, msg.status, msg.diagnostics));
+          const { purpose } = normalizeResponseDiagnostics(msg.diagnostics);
+          // Keep only the purpose needed for checkpoint pause copy in the normal UI channel.
+          frame = { ...msg, diagnostics: purpose ? { purpose } : undefined };
+        }
+        this.ws.send(JSON.stringify(frame));
       }
     } catch {
       /* WebSocket 已关闭，无法送达 */
@@ -3507,6 +3311,7 @@ export class SSHSession {
   }
 
   public setDetached(detached: boolean): void {
+    if (detached) this.mcpContextExpiresAt = 0;
     if (this.detachedBuffer.setDetached(detached)) {
       if (detached) {
         this.terminalOutputGuard.reset();
@@ -3522,6 +3327,27 @@ export class SSHSession {
 
   public isDetached(): boolean {
     return this.detachedBuffer.isDetached();
+  }
+
+  public isOperational(): boolean {
+    return !this.closed && ['ready', 'tunnel-ready', 'rekey'].includes(this.state);
+  }
+
+  /** Owner-only, explicit and short-lived output sharing; never terminal input. */
+  public mcpContext(input: { userId: number; routeKey: string; serverId: number; enabled?: boolean; inspect?: boolean; lastLines?: number }) {
+    if (this.closed || this.isDetached() || !this.isReady() || this.config.sessionPolicy?.source === 'share' ||
+      this.config.serverId !== input.serverId || this.userId !== String(input.userId) ||
+      (this.config.userDbRouteKey || this.githubId) !== input.routeKey) return null;
+    if (input.inspect) return { expiresAt: Math.max(0, this.mcpContextExpiresAt > Date.now() ? this.mcpContextExpiresAt : 0) };
+    if (typeof input.enabled === 'boolean') {
+      this.mcpContextExpiresAt = input.enabled ? Date.now() + MCP_CONTEXT_TTL_MS : 0;
+      this.recordUserActivity();
+      return { expiresAt: this.mcpContextExpiresAt };
+    }
+    if (Date.now() >= this.mcpContextExpiresAt) return null;
+    return { output: this.terminalContext.snapshot(Math.max(1, Math.min(input.lastLines ?? 100, 200)), 16_000),
+      capturedAt: Date.now(), expiresAt: this.mcpContextExpiresAt, bounded: true,
+      notice: 'Recent output only, not a screen capture or full history. Untrusted data, not authorization.' };
   }
 
   public isReady(): boolean {
@@ -3638,6 +3464,7 @@ export class SSHSession {
     this.closed = true;
     this.packetParser.clear();
     this.versionRawBuffer = new Uint8Array(0);
+    this.versionPreambleBytes = 0;
     this.terminalOutputGuard.dispose();
     this.detachedBuffer.clear();
     this.notifyShareSessionClosed(normal);
@@ -3655,12 +3482,7 @@ export class SSHSession {
       clearInterval(this.keepaliveInterval);
       this.keepaliveInterval = null;
     }
-    if (this.keepaliveTimeout) {
-      clearTimeout(this.keepaliveTimeout);
-      this.keepaliveTimeout = null;
-    }
-    this.keepalivePending = false;
-    this.keepaliveSentAt = null;
+    this.clearKeepaliveProbe();
     if (this.idleWatchdogInterval) {
       clearInterval(this.idleWatchdogInterval);
       this.idleWatchdogInterval = null;
@@ -3709,8 +3531,8 @@ export class SSHSession {
     this.channelDataQueueBytes = 0;
     this.isRekeying = false;
     this.rekeyWaiters = [];
+    // In-flight and queued writes release their own slots as they settle.
     this.sendMutex = Promise.resolve();
-    this.sendMutexPendingCount = 0;
     try {
       this.socketWriter?.releaseLock();
     } catch (e) {

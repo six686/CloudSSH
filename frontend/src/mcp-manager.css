@@ -1,0 +1,309 @@
+[data-mcp-open].hidden {
+  display: none;
+}
+.mcp-dialog {
+  width: min(44rem, calc(100vw - 2rem));
+  max-height: calc(100dvh - 2rem);
+  margin: auto;
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+  color: var(--on-surface);
+  font: inherit;
+  font-family: var(--font-ui);
+}
+.mcp-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+.mcp-dialog__panel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 0;
+  max-height: inherit;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--modal-radius);
+  box-shadow: var(--shadow-modal);
+}
+.mcp-dialog::backdrop {
+  background: var(--modal-overlay);
+}
+.mcp-dialog h2 {
+  flex: 1;
+  min-width: 0;
+}
+.mcp-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+}
+.mcp-body > p {
+  margin: 0 0 0.5rem;
+}
+.mcp-body p {
+  font-size: 0.8125rem;
+  color: var(--on-surface-variant);
+  line-height: 1.55;
+}
+.mcp-body [role="status"]:empty {
+  display: none;
+}
+.mcp-dialog details {
+  border-top: 1px solid var(--border);
+  padding: 0.65rem 0;
+}
+.mcp-dialog details > p {
+  margin: 0.5rem 0;
+}
+.mcp-dialog summary {
+  cursor: pointer;
+  min-height: 32px;
+  line-height: 1.5;
+  padding: 0.25rem 0;
+  overflow-wrap: anywhere;
+}
+.mcp-dialog details[open] > summary {
+  color: var(--accent);
+}
+.mcp-dialog fieldset {
+  min-width: 0;
+}
+#mcp-permissions {
+  border-top: 0;
+}
+.mcp-grant-count,
+.mcp-grant-description {
+  margin-inline-start: 0.65rem;
+  color: var(--on-surface-variant);
+  font-size: 0.8125rem;
+  font-weight: normal;
+}
+.mcp-grant-fields {
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+.mcp-grant-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.35rem 0 0.65rem;
+}
+.mcp-grant-toolbar select {
+  min-width: 0;
+  max-width: 100%;
+  cursor: pointer;
+}
+.mcp-grant-toolbar option {
+  background: var(--bg);
+  color: var(--on-surface);
+}
+.mcp-grant-list {
+  max-height: min(21rem, 50dvh);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+}
+.mcp-grant-list table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.8125rem;
+}
+.mcp-grant-list th {
+  padding: 0.4rem;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.mcp-grant-list thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-elevated);
+  box-shadow: inset 0 -1px var(--border);
+}
+.mcp-grant-list th:first-child {
+  width: 37%;
+  padding-inline-start: 0.65rem;
+  text-align: start;
+}
+.mcp-grant-list tbody tr + tr > * {
+  border-top: 1px solid var(--border);
+}
+.mcp-grant-list td > label {
+  justify-content: center;
+  cursor: pointer;
+}
+@media (max-width: 767px), (max-width: 1180px) and (pointer: coarse) {
+  .mcp-grant-toolbar > * {
+    min-height: 44px;
+  }
+  .mcp-grant-list {
+    /* The dialog body is the only vertical scroller on a phone. */
+    max-height: none;
+    overflow: visible;
+    border: 0;
+  }
+  .mcp-grant-list details {
+    padding: 0;
+  }
+  .mcp-grant-list summary {
+    min-height: 44px;
+    padding: 0.65rem 0;
+  }
+  .mcp-grant-choices {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 0 0.5rem 0.5rem;
+  }
+  .mcp-grant-list .mcp-grant-choices label {
+    min-height: 44px;
+  }
+}
+@media (max-width: 380px) {
+  .mcp-grant-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.mcp-dialog label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 36px;
+  font-size: 0.8125rem;
+}
+.mcp-dialog input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+}
+.mcp-access-fields {
+  display: grid;
+  gap: 0.65rem;
+  border: 0;
+  padding: 0.5rem 0;
+}
+.mcp-access-fields > label:not(:last-child),
+#mcp-config-preview > label {
+  flex-direction: column;
+  align-items: stretch;
+}
+.mcp-access-fields legend {
+  font-size: 0.8125rem;
+  color: var(--on-surface-variant);
+}
+.mcp-access-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 0.5rem 0;
+  font-size: 0.8125rem;
+}
+.mcp-access-links a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.mcp-dialog input:not([type="checkbox"]),
+.mcp-dialog textarea {
+  width: 100%;
+  min-width: 0;
+}
+.mcp-dialog textarea {
+  resize: vertical;
+}
+.mcp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+.mcp-activity-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.3rem 0 0.5rem;
+}
+.mcp-activity-toolbar .assistant-action[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.mcp-activity-scope:not([hidden]) {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 100%;
+  font-size: 0.8125rem;
+}
+.mcp-activity-scope select {
+  min-width: 0;
+  max-width: min(13rem, 60vw);
+  cursor: pointer;
+}
+.mcp-activity-scope option {
+  background: var(--bg);
+  color: var(--on-surface);
+}
+#mcp-activity-list {
+  max-height: min(20rem, 45dvh);
+  overflow: auto;
+}
+.mcp-activity-day {
+  margin: 0;
+  padding: 0.25rem 0;
+  color: var(--on-surface-variant);
+  font-size: 0.75rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.mcp-activity-rows {
+  list-style: none;
+  margin: 0 0 0.3rem;
+  padding: 0;
+}
+.mcp-dialog .mcp-operation {
+  min-width: max-content;
+  padding: 0.2rem 0;
+  font-family: var(--font-code);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.mcp-operation[data-status="error"],
+.mcp-operation[data-status="failed"],
+.mcp-operation[data-status="unknown"] {
+  font-weight: 600;
+}
+@media (pointer: coarse), (max-width: 520px) {
+  .mcp-activity-scope select,
+  .mcp-dialog label,
+  .mcp-dialog summary,
+  .mcp-dialog .assistant-action {
+    min-height: 44px;
+  }
+}
+@media (max-width: 520px) {
+  .mcp-dialog {
+    width: calc(100vw - 1rem);
+    max-height: calc(100dvh - 1rem);
+  }
+  .mcp-body {
+    padding: 0.75rem;
+  }
+  .mcp-actions {
+    padding: 0.75rem;
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  }
+  .mcp-actions > button {
+    flex: 1 1 auto;
+  }
+}

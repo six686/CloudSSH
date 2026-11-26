@@ -48,6 +48,8 @@ export interface SSHConnectionConfig {
   password: string;
   authMethod?: 'password' | 'publickey' | 'none';
   privateKey?: string;
+  /** 可选 OpenSSH 用户证书（单行文本或 Base64） */
+  certificate?: string;
   cols?: number;
   rows?: number;
   expectedFingerprint?: string;
@@ -55,6 +57,11 @@ export interface SSHConnectionConfig {
   knownHostIdentity?: string;
   userId?: string;
   githubId?: string;
+  /**
+   * UserDBDO 路由键。GitHub / 管理员与 githubId 相同；
+   * Access 用户是邮箱路由键，不能用哨兵 githubId `-2`。
+   */
+  userDbRouteKey?: string;
   /** 已保存服务器的记录 ID（token 路径下由 handleConnectServer 填充，供 OS 检测持久化） */
   serverId?: number;
   /** 已检测并持久化的操作系统标识（已设置则连接时跳过重复检测） */
@@ -113,6 +120,8 @@ export interface SSHJumpHostConfig {
   password: string;
   authMethod: 'password' | 'publickey' | 'none';
   privateKey: string;
+  /** 可选 OpenSSH 用户证书 */
+  certificate?: string;
   expectedFingerprint?: string;
   knownHostIdentity: string;
 }
@@ -165,9 +174,10 @@ export function normalizeTerminalSize(cols: unknown, rows: unknown): TerminalSiz
 
 export interface Env {
   SSH_SESSION: DurableObjectNamespace;
+  /** Isolated, bounded personal MCP execution pools. Optional during staged deployment. */
+  MCP_EXECUTION?: DurableObjectNamespace;
   USER_DB: DurableObjectNamespace;
   SSH_SHARE: DurableObjectNamespace;
-  MAX_CONNECTIONS?: string;
   IDLE_TIMEOUT?: string;
   TURNSTILE_SECRET?: string;
   TURNSTILE_SITEKEY?: string;
@@ -176,21 +186,19 @@ export interface Env {
   GITHUB_CLIENT_SECRET?: string;
   // GitHub 登录白名单（可选，逗号分隔的数字 GitHub user ID；未配置则不限制）
   GITHUB_ALLOWED_USER_IDS?: string;
-  // 是否强制 GitHub 登录后才能使用 SSH（可选，默认 false）
-  REQUIRE_GITHUB_AUTH?: string;
+  // 普通 SSH 连接是否必须先登录（生产默认 false，测试默认 true）
+  REQUIRE_AUTH?: string;
   BASE_URL?: string;
-  // 主机密钥验证严格模式（默认 true，设为 false 可跳过签名验证失败）
-  STRICT_HOST_KEY_VERIFY?: string;
   // 调试模式（设为 true 启用调试日志输出到前端）
   DEBUG_MODE?: string;
-  // 一次性 SSH 分享（默认关闭；true 时登录用户可创建分享链接）
-  ENABLE_SSH_SHARING?: string;
   // 单管理员密码认证（可选）。
   // 格式：pbkdf2$sha256$<iterations>$<salt-b64url>$<verifier-b64url>，由 `pnpm run hash-password` 生成。
   // 非空且格式合法即启用密码模式：GitHub OAuth 路由禁用，全实例仅本地管理员一个账号。
   // 置空/删除即刻退回 GitHub 模式；verifier = SHA-256(PBKDF2(password, salt, iterations))。
   // 浏览器端执行 PBKDF2 预拉伸（server relief），Worker 侧仅做一次 SHA-256 比对（Free 套餐 CPU 安全）。
   ADMIN_PASSWORD_HASH?: string;
+  // 强制 Cloudflare Access 模式（可选；运行时 ctx.access 自动感知，绝不信任原始身份标头）
+  CF_ACCESS?: string;
 }
 
 /** /api/config 下发的密码认证公开参数（盐与迭代数非机密，供浏览器预拉伸） */
@@ -204,8 +212,10 @@ export interface UserInfo {
   id: number;
   github_id: number;
   username: string;
-  /** 本地管理员（密码模式）无头像，恒为 null；GitHub 用户为头像 URL */
+  /** 本地管理员（密码模式）与 CF Access 用户无头像，恒为 null；GitHub 用户为头像 URL */
   avatar_url: string | null;
+  /** Cloudflare Access 模式下的已验证邮箱 */
+  email?: string | null;
 }
 
 export interface ServerConfig {
@@ -234,6 +244,8 @@ export interface ServerConfig {
   cf_access_client_id?: string | null;
   /** 是否已保存 Cloudflare Zero Trust Access Service Token Secret */
   has_cf_access_client_secret?: boolean;
+  /** Cloudflare Zero Trust SSH CA 团队标识（非空表示使用原生 SSH CA 短期证书认证） */
+  cf_ssh_ca_team?: string | null;
   /** 最近连接成功的 Unix 毫秒时间戳 */
   last_connected_at?: number | null;
   created_at: string;
